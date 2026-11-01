@@ -2,8 +2,9 @@ FROM rust:1.99-bookworm AS builder
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY bloklid ./bloklid
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
+ARG TARGETARCH
+RUN --mount=type=cache,id=blokli-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry \
+    --mount=type=cache,id=blokli-target-${TARGETARCH},target=/src/target \
     cargo build --locked --release --bin blokli-light --bin blokli-contract-deployer \
     && mkdir /out \
     && cp /src/target/release/blokli-light /out/blokli-light \
