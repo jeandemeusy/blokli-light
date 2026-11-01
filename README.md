@@ -1,14 +1,21 @@
-# Blokli
+# blokli-light
 
 [![codecov](https://codecov.io/gh/hoprnet/blokli/branch/main/graph/badge.svg)](https://codecov.io/gh/hoprnet/blokli)
 
-This repository contains `Blokli`: On-chain Indexer of HOPR smart contracts and on-chain operations provider.
+`blokli-light` is a PostgreSQL raw-log indexer for HOPR contracts and operator-defined contracts on one chain. It stores matching Ethereum
+logs without interpreting them, so SQL tools such as Arrakis can query and chart the data directly.
+
+This repository is a GPL-3.0-only fork of [`hoprnet/blokli`](https://github.com/hoprnet/blokli), based on commit
+[`2c9ecb7`](https://github.com/hoprnet/blokli/commit/2c9ecb7) (`chore(deps): curvy-bindings 0.1.0- #561`). Its history is retained for
+attribution; the upstream remote is intentionally not configured.
 
 ## Components
 
-- `bloklid`: Daemon that indexes on-chain events and submits transactions
-- `blokli-api`: GraphQL server for querying indexed data and streaming updates over SSE with keep-alive support
-- `db`: Database abstractions, entities, and migrations
+- `blokli-light`: Daemon that indexes raw on-chain logs into PostgreSQL
+- `db`: PostgreSQL schema, migrations, and raw-log persistence
+
+The daemon intentionally has no GraphQL API, subscriptions, transaction submission, event handlers, snapshots, or derived account/channel
+tables. Event interpretation belongs in downstream SQL.
 
 ## Development
 

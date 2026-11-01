@@ -1,7 +1,0 @@
----
-source: chain/api/src/safe_execution.rs
-expression: snap(&result)
----
-success: false
-safe_tx_hash: ~
-revert_reason: ~

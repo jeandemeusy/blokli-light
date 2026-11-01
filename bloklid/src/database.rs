@@ -1,0 +1,603 @@
+use std::fmt;
+
+use sqlx::{PgPool, Postgres, pool::PoolConnection, postgres::PgPoolOptions};
+use thiserror::Error;
+
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
+/// A raw Ethereum log in the byte-exact layout persisted by blokli-light.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RawLog {
+    /// Position of the transaction in its block.
+    pub tx_index: u64,
+    /// Position of the log in its block.
+    pub log_index: u64,
+    /// Number of the block containing this log.
+    pub block_number: u64,
+    /// Hash of the containing block.
+    pub block_hash: [u8; 32],
+    /// Hash of the containing transaction.
+    pub transaction_hash: [u8; 32],
+    /// Emitting contract address.
+    pub address: [u8; 20],
+    /// Concatenated 32-byte topics, with topic0 first.
+    pub topics: Vec<u8>,
+    /// ABI-encoded event payload.
+    pub data: Vec<u8>,
+    /// Whether the RPC has marked the log as removed by a chain reorganisation.
+    pub removed: bool,
+}
+
+/// Origin of a watched contract address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceKind {
+    /// A contract address supplied by `hopr-bindings` or the daemon's contract overrides.
+    Builtin,
+    /// A contract address registered by an operator.
+    Custom,
+}
+
+impl SourceKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Builtin => "builtin",
+            Self::Custom => "custom",
+        }
+    }
+}
+
+/// A source definition ready to be persisted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewSource {
+    /// Stable operator-facing source name.
+    pub name: String,
+    /// Contract emitting the logs.
+    pub address: [u8; 20],
+    /// Whether the source is supplied by bindings or an operator.
+    pub kind: SourceKind,
+    /// First block that must be fetched for this source.
+    pub from_block: u64,
+    /// `None` follows every event; otherwise these are normalised `0x` topic0 hashes.
+    pub events: Option<Vec<String>>,
+}
+
+impl NewSource {
+    /// Validates source fields which do not require RPC access.
+    pub fn validate(&self) -> Result<(), DatabaseError> {
+        if self.name.trim().is_empty() {
+            return Err(DatabaseError::EmptySourceName);
+        }
+
+        if self.from_block > i64::MAX as u64 {
+            return Err(DatabaseError::BigIntOverflow {
+                name: "from_block",
+                value: self.from_block,
+            });
+        }
+
+        Ok(())
+    }
+}
+
+/// Persisted source state used by indexing and status commands.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Source {
+    /// Stable source identifier.
+    pub id: i64,
+    /// Stable operator-facing source name.
+    pub name: String,
+    /// Contract emitting the logs.
+    pub address: [u8; 20],
+    /// Whether the source is supplied by bindings or an operator.
+    pub kind: SourceKind,
+    /// First block that must be fetched for this source.
+    pub from_block: u64,
+    /// Highest block completely indexed for this source.
+    pub indexed_to: i64,
+    /// `None` follows every event; otherwise these are normalised `0x` topic0 hashes.
+    pub events: Option<Vec<String>>,
+    /// Whether the follower should include this source.
+    pub enabled: bool,
+}
+
+/// The global raw-log indexing watermark exposed for Arrakis compatibility.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChainInfo {
+    /// Last fully indexed built-in block.
+    pub last_indexed_block: u64,
+    /// Position within `last_indexed_block`, when a log was stored there.
+    pub last_indexed_tx_index: Option<u64>,
+    /// Position within `last_indexed_block`, when a log was stored there.
+    pub last_indexed_log_index: Option<u64>,
+    /// Last RPC head observed before finality adjustment.
+    pub head_block: Option<u64>,
+}
+
+impl RawLog {
+    /// Validates values which PostgreSQL cannot represent in its signed bigint columns.
+    pub fn validate(&self) -> Result<(), DatabaseError> {
+        if !self.topics.len().is_multiple_of(32) {
+            return Err(DatabaseError::InvalidTopicsLength(self.topics.len()));
+        }
+
+        for (name, value) in [
+            ("tx_index", self.tx_index),
+            ("log_index", self.log_index),
+            ("block_number", self.block_number),
+        ] {
+            if value > i64::MAX as u64 {
+                return Err(DatabaseError::BigIntOverflow { name, value });
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// PostgreSQL access used by the indexer and administrative commands.
+#[derive(Clone)]
+pub struct Database {
+    pool: PgPool,
+}
+
+impl fmt::Debug for Database {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("Database").finish_non_exhaustive()
+    }
+}
+
+impl Database {
+    /// Opens a PostgreSQL pool without applying migrations.
+    pub async fn connect(database_url: &str) -> Result<Self, DatabaseError> {
+        let pool = PgPoolOptions::new().connect(database_url).await?;
+        Ok(Self { pool })
+    }
+
+    /// Applies the one-way schema migrations and creates the chain-info singleton.
+    pub async fn migrate(&self) -> Result<(), DatabaseError> {
+        MIGRATOR.run(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Obtains the session-scoped lock used to guarantee one writer per database.
+    ///
+    /// The returned guard must remain alive for the lifetime of the writer. PostgreSQL
+    /// associates advisory locks with one physical connection, so returning only a boolean
+    /// would allow the connection to return to the pool and silently release the guarantee.
+    pub async fn try_advisory_lock(&self) -> Result<Option<AdvisoryLock>, DatabaseError> {
+        const LOCK_KEY: i64 = 0x626c_6f6b_6c69_6c67;
+        let mut connection = self.pool.acquire().await?;
+        let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+            .bind(LOCK_KEY)
+            .fetch_one(&mut *connection)
+            .await?;
+
+        if acquired {
+            Ok(Some(AdvisoryLock {
+                connection,
+                key: LOCK_KEY,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Stores raw logs idempotently, replacing a position if a reorganisation changed its block hash.
+    ///
+    /// Callers must run this in the same transaction as their watermark update.
+    pub async fn store_logs(&self, logs: &[RawLog]) -> Result<(), DatabaseError> {
+        let mut transaction = self.pool.begin().await?;
+        self.store_logs_in_transaction(&mut transaction, logs).await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    /// Atomically stores a completed source batch and advances its per-source watermark.
+    pub async fn store_source_batch(
+        &self,
+        source_name: &str,
+        completed_through: u64,
+        logs: &[RawLog],
+    ) -> Result<(), DatabaseError> {
+        let completed_through = to_bigint("completed_through", completed_through)?;
+        let mut transaction = self.pool.begin().await?;
+        self.store_logs_in_transaction(&mut transaction, logs).await?;
+        let result =
+            sqlx::query("UPDATE source SET indexed_to = GREATEST(indexed_to, $2) WHERE name = $1 AND enabled = true")
+                .bind(source_name)
+                .bind(completed_through)
+                .execute(&mut *transaction)
+                .await?;
+        if result.rows_affected() == 0 {
+            return Err(DatabaseError::EnabledSourceNotFound(source_name.to_owned()));
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    /// Atomically stores a follower batch, advances every followed source, and updates the
+    /// Arrakis-compatible built-in watermark.
+    pub async fn store_follower_batch(
+        &self,
+        completed_through: u64,
+        head_block: u64,
+        source_names: &[String],
+        logs: &[RawLog],
+    ) -> Result<(), DatabaseError> {
+        let completed_block = completed_through;
+        let completed_through = to_bigint("completed_through", completed_through)?;
+        let head_block = to_bigint("head_block", head_block)?;
+        let position = logs
+            .iter()
+            .filter(|log| log.block_number == completed_block)
+            .max_by_key(|log| (log.tx_index, log.log_index));
+        let last_tx_index = position.map(|log| to_bigint("tx_index", log.tx_index)).transpose()?;
+        let last_log_index = position.map(|log| to_bigint("log_index", log.log_index)).transpose()?;
+
+        let mut transaction = self.pool.begin().await?;
+        self.store_logs_in_transaction(&mut transaction, logs).await?;
+        sqlx::query("UPDATE source SET indexed_to = GREATEST(indexed_to, $1) WHERE name = ANY($2) AND enabled = true")
+            .bind(completed_through)
+            .bind(source_names)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query(
+            "UPDATE chain_info SET last_indexed_block = GREATEST(last_indexed_block, $1), last_indexed_tx_index = $2, \
+             last_indexed_log_index = $3, head_block = $4, updated_at = now() WHERE id = 1",
+        )
+        .bind(completed_through)
+        .bind(last_tx_index)
+        .bind(last_log_index)
+        .bind(head_block)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query("SELECT pg_notify('blokli_light_head', $1)")
+            .bind(completed_through.to_string())
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    /// Returns the singleton chain watermark, which always exists after migration.
+    pub async fn chain_info(&self) -> Result<ChainInfo, DatabaseError> {
+        let row = sqlx::query_as::<_, ChainInfoRow>(
+            "SELECT last_indexed_block, last_indexed_tx_index, last_indexed_log_index, head_block FROM chain_info \
+             WHERE id = 1",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        row.try_into()
+    }
+
+    /// Inserts or reconciles a source from bindings or operator configuration.
+    ///
+    /// Reconciliation never discards indexed data. Moving `from_block` earlier resets
+    /// the source watermark so the missing range is backfilled; moving it later is ignored.
+    pub async fn upsert_source(&self, source: &NewSource) -> Result<Source, DatabaseError> {
+        source.validate()?;
+
+        let existing = sqlx::query_scalar::<_, Vec<u8>>("SELECT address FROM source WHERE name = $1")
+            .bind(&source.name)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        if let Some(address) = existing
+            && address.as_slice() != source.address
+        {
+            return Err(DatabaseError::SourceAddressImmutable(source.name.clone()));
+        }
+
+        let source = sqlx::query_as::<_, SourceRow>(
+            "INSERT INTO source (name, address, kind, from_block, indexed_to, events) VALUES ($1, $2, $3, $4, $4 - 1, \
+             $5) ON CONFLICT (name) DO UPDATE SET kind = EXCLUDED.kind, from_block = LEAST(source.from_block, \
+             EXCLUDED.from_block), indexed_to = CASE WHEN EXCLUDED.from_block < source.from_block THEN \
+             LEAST(source.indexed_to, EXCLUDED.from_block - 1) ELSE source.indexed_to END, events = EXCLUDED.events, \
+             enabled = true RETURNING id, name, address, kind, from_block, indexed_to, events, enabled",
+        )
+        .bind(&source.name)
+        .bind(source.address.as_slice())
+        .bind(source.kind.as_str())
+        .bind(
+            i64::try_from(source.from_block).map_err(|_| DatabaseError::BigIntOverflow {
+                name: "from_block",
+                value: source.from_block,
+            })?,
+        )
+        .bind(&source.events)
+        .fetch_one(&self.pool)
+        .await?;
+
+        source.try_into()
+    }
+
+    /// Adds events to a custom source and resets its watermark for an idempotent re-backfill.
+    pub async fn widen_source(&self, name: &str, events: &[String]) -> Result<Source, DatabaseError> {
+        if events.is_empty() {
+            return Err(DatabaseError::EmptySourceEventSet);
+        }
+
+        let source = sqlx::query_as::<_, SourceRow>(
+            "UPDATE source SET events = ARRAY(SELECT DISTINCT event FROM unnest(COALESCE(events, ARRAY[]::text[]) || \
+             $2::text[]) AS event), indexed_to = from_block - 1, enabled = true WHERE name = $1 AND kind = 'custom' \
+             AND events IS NOT NULL RETURNING id, name, address, kind, from_block, indexed_to, events, enabled",
+        )
+        .bind(name)
+        .bind(events)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| DatabaseError::CustomSourceNotFound(name.to_owned()))?;
+
+        source.try_into()
+    }
+
+    /// Stops following a custom source without modifying its historic logs.
+    pub async fn disable_source(&self, name: &str) -> Result<(), DatabaseError> {
+        let result = sqlx::query("UPDATE source SET enabled = false WHERE name = $1 AND kind = 'custom'")
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(DatabaseError::CustomSourceNotFound(name.to_owned()));
+        }
+
+        Ok(())
+    }
+
+    /// Lists sources, including disabled sources whose historic logs remain queryable.
+    pub async fn list_sources(&self) -> Result<Vec<Source>, DatabaseError> {
+        sqlx::query_as::<_, SourceRow>(
+            "SELECT id, name, address, kind, from_block, indexed_to, events, enabled FROM source ORDER BY name",
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(TryInto::try_into)
+        .collect()
+    }
+
+    async fn store_logs_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        logs: &[RawLog],
+    ) -> Result<(), DatabaseError> {
+        for log in logs {
+            log.validate()?;
+
+            sqlx::query(
+                "INSERT INTO log (tx_index, log_index, block_number, block_hash, transaction_hash, address, topics, \
+                 data, removed) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (block_number, tx_index, \
+                 log_index) DO UPDATE SET block_hash = EXCLUDED.block_hash, transaction_hash = \
+                 EXCLUDED.transaction_hash, address = EXCLUDED.address, topics = EXCLUDED.topics, data = \
+                 EXCLUDED.data, removed = EXCLUDED.removed WHERE log.block_hash <> EXCLUDED.block_hash OR log.removed \
+                 <> EXCLUDED.removed",
+            )
+            .bind(i64::try_from(log.tx_index).map_err(|_| DatabaseError::BigIntOverflow {
+                name: "tx_index",
+                value: log.tx_index,
+            })?)
+            .bind(i64::try_from(log.log_index).map_err(|_| DatabaseError::BigIntOverflow {
+                name: "log_index",
+                value: log.log_index,
+            })?)
+            .bind(
+                i64::try_from(log.block_number).map_err(|_| DatabaseError::BigIntOverflow {
+                    name: "block_number",
+                    value: log.block_number,
+                })?,
+            )
+            .bind(log.block_hash.as_slice())
+            .bind(log.transaction_hash.as_slice())
+            .bind(log.address.as_slice())
+            .bind(&log.topics)
+            .bind(&log.data)
+            .bind(log.removed)
+            .execute(&mut **transaction)
+            .await?;
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct SourceRow {
+    id: i64,
+    name: String,
+    address: Vec<u8>,
+    kind: String,
+    from_block: i64,
+    indexed_to: i64,
+    events: Option<Vec<String>>,
+    enabled: bool,
+}
+
+#[derive(sqlx::FromRow)]
+struct ChainInfoRow {
+    last_indexed_block: i64,
+    last_indexed_tx_index: Option<i64>,
+    last_indexed_log_index: Option<i64>,
+    head_block: Option<i64>,
+}
+
+impl TryFrom<ChainInfoRow> for ChainInfo {
+    type Error = DatabaseError;
+
+    fn try_from(value: ChainInfoRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            last_indexed_block: from_bigint("last_indexed_block", value.last_indexed_block)?,
+            last_indexed_tx_index: value
+                .last_indexed_tx_index
+                .map(|value| from_bigint("last_indexed_tx_index", value))
+                .transpose()?,
+            last_indexed_log_index: value
+                .last_indexed_log_index
+                .map(|value| from_bigint("last_indexed_log_index", value))
+                .transpose()?,
+            head_block: value
+                .head_block
+                .map(|value| from_bigint("head_block", value))
+                .transpose()?,
+        })
+    }
+}
+
+impl TryFrom<SourceRow> for Source {
+    type Error = DatabaseError;
+
+    fn try_from(value: SourceRow) -> Result<Self, Self::Error> {
+        let address = value
+            .address
+            .try_into()
+            .map_err(|address: Vec<u8>| DatabaseError::InvalidSourceAddressLength(address.len()))?;
+        let kind = match value.kind.as_str() {
+            "builtin" => SourceKind::Builtin,
+            "custom" => SourceKind::Custom,
+            kind => return Err(DatabaseError::InvalidSourceKind(kind.to_owned())),
+        };
+        let from_block = from_bigint("from_block", value.from_block)?;
+
+        Ok(Self {
+            id: value.id,
+            name: value.name,
+            address,
+            kind,
+            from_block,
+            indexed_to: value.indexed_to,
+            events: value.events,
+            enabled: value.enabled,
+        })
+    }
+}
+
+fn to_bigint(name: &'static str, value: u64) -> Result<i64, DatabaseError> {
+    i64::try_from(value).map_err(|_| DatabaseError::BigIntOverflow { name, value })
+}
+
+fn from_bigint(name: &'static str, value: i64) -> Result<u64, DatabaseError> {
+    u64::try_from(value).map_err(|_| DatabaseError::InvalidStoredBlockNumber(name, value))
+}
+
+/// Guard retaining the PostgreSQL session that owns the daemon writer lock.
+pub struct AdvisoryLock {
+    connection: PoolConnection<Postgres>,
+    key: i64,
+}
+
+impl fmt::Debug for AdvisoryLock {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("AdvisoryLock").finish_non_exhaustive()
+    }
+}
+
+impl AdvisoryLock {
+    /// Explicitly releases the writer lock before returning its connection to the pool.
+    pub async fn release(mut self) -> Result<(), DatabaseError> {
+        let released: bool = sqlx::query_scalar("SELECT pg_advisory_unlock($1)")
+            .bind(self.key)
+            .fetch_one(&mut *self.connection)
+            .await?;
+
+        if released {
+            Ok(())
+        } else {
+            Err(DatabaseError::AdvisoryLockNotHeld)
+        }
+    }
+}
+
+/// Errors produced by the PostgreSQL storage layer.
+#[derive(Debug, Error)]
+pub enum DatabaseError {
+    /// A source name must contain non-whitespace characters.
+    #[error("source name cannot be empty")]
+    EmptySourceName,
+    /// A `widen` operation must introduce at least one event.
+    #[error("source event set cannot be empty")]
+    EmptySourceEventSet,
+    /// A stored source name already belongs to a different contract address.
+    #[error("source '{0}' cannot change address; add a new source instead")]
+    SourceAddressImmutable(String),
+    /// A custom source could not be found or is a built-in source.
+    #[error("custom source '{0}' was not found")]
+    CustomSourceNotFound(String),
+    /// A source batch was committed for a source that is disabled or absent.
+    #[error("enabled source '{0}' was not found")]
+    EnabledSourceNotFound(String),
+    /// A source row has an invalid persisted address width.
+    #[error("stored source address must be 20 bytes, got {0}")]
+    InvalidSourceAddressLength(usize),
+    /// A source row contains a kind outside the migration's allowed values.
+    #[error("stored source kind is invalid: {0}")]
+    InvalidSourceKind(String),
+    /// A stored signed block field cannot be represented by the public unsigned model.
+    #[error("stored {0} is negative: {1}")]
+    InvalidStoredBlockNumber(&'static str, i64),
+    /// The PostgreSQL session no longer held the expected advisory lock.
+    #[error("PostgreSQL advisory lock was not held by this session")]
+    AdvisoryLockNotHeld,
+    /// A log's concatenated topic bytes do not consist of complete 32-byte words.
+    #[error("topics must be a concatenation of 32-byte values, got {0} bytes")]
+    InvalidTopicsLength(usize),
+    /// A Rust unsigned value cannot be stored in PostgreSQL's signed bigint type.
+    #[error("{name} value {value} exceeds PostgreSQL bigint")]
+    BigIntOverflow {
+        /// Field that overflowed.
+        name: &'static str,
+        /// Original unsigned value.
+        value: u64,
+    },
+    /// An error reported by PostgreSQL or SQLx.
+    #[error(transparent)]
+    Sqlx(#[from] sqlx::Error),
+    /// A migration error reported by SQLx.
+    #[error(transparent)]
+    Migration(#[from] sqlx::migrate::MigrateError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DatabaseError, RawLog};
+
+    fn log_with_topics(topics: Vec<u8>) -> RawLog {
+        RawLog {
+            tx_index: 0,
+            log_index: 0,
+            block_number: 0,
+            block_hash: [0; 32],
+            transaction_hash: [0; 32],
+            address: [0; 20],
+            topics,
+            data: Vec::new(),
+            removed: false,
+        }
+    }
+
+    #[test]
+    fn validates_complete_topic_words() {
+        assert!(log_with_topics(vec![0; 64]).validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_partial_topic_words() {
+        assert!(matches!(
+            log_with_topics(vec![0; 31]).validate(),
+            Err(DatabaseError::InvalidTopicsLength(31))
+        ));
+    }
+
+    #[test]
+    fn rejects_unsigned_values_outside_postgres_bigint() {
+        let mut log = log_with_topics(Vec::new());
+        log.block_number = i64::MAX as u64 + 1;
+
+        assert!(matches!(
+            log.validate(),
+            Err(DatabaseError::BigIntOverflow {
+                name: "block_number",
+                ..
+            })
+        ));
+    }
+}

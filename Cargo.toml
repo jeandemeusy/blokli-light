@@ -3,17 +3,7 @@
 resolver = "2"
 
 members = [
-  "api",
   "bloklid",
-  "chain/api",
-  "chain/indexer",
-  "chain/rpc",
-  "chain/types",
-  "db/core",
-  "db/entity",
-  "db/migration",
-  "helper",
-  "types",
 ]
 
 [workspace.dependencies]
@@ -36,15 +26,6 @@ async-trait = "0.1.89"
 axum = { version = "0.8.9", features = ["http2", "ws"] }
 backon = { version = "1.6.0", default-features = false }
 base64ct = "1.8.3"
-blokli-api = { path = "api" }
-blokli-api-types = { path = "types" }
-blokli-chain-api = { path = "chain/api" }
-blokli-chain-indexer = { path = "chain/indexer" }
-blokli-chain-rpc = { path = "chain/rpc" }
-blokli-chain-types = { path = "chain/types" }
-blokli-db = { path = "db/core" }
-blokli-db-entity = { path = "db/entity" }
-blokli-db-migration = { path = "db/migration" }
 chrono = "0.4.45"
 clap = { version = "4.6.1", features = ["derive", "env", "string"] }
 config = "0.15.23"
@@ -112,8 +93,13 @@ serde_with = { version = "3.21.0" }
 serde_yaml = { package = "yaml_serde", version = "0.10.7" }
 smart-default = "0.7.1"
 sqlx = { version = "0.9.0", default-features = false, features = [
+  "derive",
+  "macros",
+  "migrate",
   "postgres",
+  "runtime-tokio",
   "sqlite",
+  "tls-rustls-ring-webpki",
 ] }
 strum = { version = "0.28.0", features = ["derive"] }
 sysinfo = "0.39.3"
