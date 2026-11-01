@@ -10,3 +10,4 @@ pub mod database;
 pub mod indexer;
 pub mod rpc;
 pub mod source;
+pub mod telemetry;

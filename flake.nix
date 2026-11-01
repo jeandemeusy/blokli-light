@@ -136,7 +136,7 @@
             cargoToml = ./bloklid/Cargo.toml;
           };
           bloklidCrateInfo = {
-            pname = "bloklid";
+            pname = "blokli-light";
             # Normalize version to major.minor.patch for consistent caching
             version = pkgs.lib.strings.concatStringsSep "." (
               pkgs.lib.lists.take 3 (builtins.splitVersion bloklidCrateInfoOriginal.version)
@@ -150,7 +150,7 @@
               root = ./.;
               extraExtensions = [
                 "csv"
-                "graphql"
+                "sql"
               ];
             };
             test = nixLib.mkTestSrc {
@@ -158,7 +158,7 @@
               root = ./.;
               extraExtensions = [
                 "csv"
-                "graphql"
+                "sql"
                 "pem"
                 "snap"
               ];
@@ -225,13 +225,6 @@
               ln -s ${binary}/bin/${name} $out/bin/${name}
             '';
 
-          # Helper: build the anvil shell-script entrypoint for a given target platform.
-          mkBlokliAnvilEntrypoint =
-            targetPlatform:
-            platformPkgsMap.${targetPlatform}.writeShellScriptBin "blokli-anvil-entrypoint" (
-              builtins.readFile ./docker/blokli-anvil-entrypoint.sh
-            );
-
           # Helper: build a standard bloklid Docker image for a target platform.
           # variant is null (release), "dev", or "profile".
           mkBloklidDocker =
@@ -239,48 +232,19 @@
             let
               platformPkgs = platformPkgsMap.${targetPlatform};
               binarySuffix = if variant == null then "" else "-${variant}";
-              dockerName = "bloklid${if variant == null then "" else "-${variant}"}";
+              dockerName = "blokli-light${if variant == null then "" else "-${variant}"}";
               binary = bloklidPackages."binary-bloklid-${targetPlatform}${binarySuffix}";
             in
             nixLib.mkDockerImage {
               name = dockerName;
-              Entrypoint = [ "/bin/bloklid" ];
+              Entrypoint = [ "/bin/blokli-light" ];
               pkgsLinux = platformPkgs;
               extraContents = [
                 binary
                 (mkStaticEntrypoint {
                   pkgs = platformPkgs;
                   inherit binary;
-                  name = "bloklid";
-                })
-              ];
-            };
-
-          # Build the local Anvil image with HOPR and Curvy contracts deployed.
-          mkBloklidAnvilDocker =
-            targetPlatform:
-            let
-              platformPkgs = platformPkgsMap.${targetPlatform};
-              binary = bloklidPackages."binary-bloklid-${targetPlatform}";
-              anvilEntrypoint = mkBlokliAnvilEntrypoint targetPlatform;
-            in
-            nixLib.mkDockerImage {
-              name = "bloklid-anvil";
-              Entrypoint = [ "/bin/blokli-anvil-entrypoint" ];
-              pkgsLinux = platformPkgs;
-              env = [
-                "BLOKLI_DEPLOY_CURVY=true"
-              ];
-              extraContents = [
-                binary
-                platformPkgs.curl
-                # The Nixpkgs Foundry 1.7.1 package embeds vulnerable quinn-proto
-                # 0.11.14. The pinned foundry.nix nightly uses 0.11.16.
-                platformPkgs.foundry-bin
-                (mkStaticEntrypoint {
-                  pkgs = platformPkgs;
-                  binary = anvilEntrypoint;
-                  name = "blokli-anvil-entrypoint";
+                  name = "blokli-light";
                 })
               ];
             };
@@ -289,10 +253,8 @@
           bloklidDocker = {
             docker-bloklid-x86_64-linux = mkBloklidDocker "x86_64-linux" null;
             docker-bloklid-x86_64-linux-dev = mkBloklidDocker "x86_64-linux" "dev";
-            docker-bloklid-anvil-x86_64-linux = mkBloklidAnvilDocker "x86_64-linux";
             docker-bloklid-aarch64-linux = mkBloklidDocker "aarch64-linux" null;
             docker-bloklid-aarch64-linux-dev = mkBloklidDocker "aarch64-linux" "dev";
-            docker-bloklid-anvil-aarch64-linux = mkBloklidAnvilDocker "aarch64-linux";
           };
 
           # Combine all packages
@@ -314,7 +276,7 @@
 
               # Man pages
               bloklid-man = nixLib.mkManPage {
-                pname = "bloklid";
+                pname = "blokli-light";
                 binary = bloklidPackages.bloklid-dev;
                 description = "BLOKLID node executable";
               };
@@ -329,15 +291,6 @@
               program = toString (
                 pkgs.writeShellScript "test" ''
                   nix develop --command ${pkgs.just}/bin/just test
-                ''
-              );
-            };
-            nextest = {
-              type = "app";
-              program = toString (
-                pkgs.writeShellScript "nextest" ''
-                  export PATH="${pkgs.cargo-nextest}/bin:$PATH"
-                  nix develop --command ${pkgs.just}/bin/just nextest
                 ''
               );
             };
@@ -471,10 +424,6 @@
               "bloklid/.dockerignore"
               "tests/pytest.ini"
 
-              # Generated GraphQL schema (formatted separately)
-              "schema.graphql"
-              "design/target-api-schema.graphql"
-
               # locally installed npm packages
               ".npm/"
             ];
@@ -490,29 +439,6 @@
                 ".github/labeler.yml"
                 ".github/workflows/*.yaml"
               ];
-              # GraphQL formatter — uses prettier (nix-packaged) instead of bunx
-              settings.formatter.format-graphql = {
-                command = pkgs.writeShellApplication {
-                  name = "format-graphql";
-                  runtimeInputs = with pkgs; [
-                    prettier
-                  ];
-                  text = ''
-                    prettier --parser graphql --write "$@"
-                  '';
-                };
-                includes = [ "design/*.graphql" ];
-              };
-              settings.formatter.graphql-schema-linter = {
-                command = pkgs.writeShellApplication {
-                  name = "graphql-schema-linter";
-                  runtimeInputs = [ pkgs.nodejs ];
-                  text = ''
-                    npx --yes graphql-schema-linter "$@"
-                  '';
-                };
-                includes = [ "design/*.graphql" ];
-              };
               # Markdown formatter
               settings.formatter.deno = {
                 command = pkgs.writeShellApplication {
@@ -559,16 +485,7 @@
           inherit checks;
 
           # Export applications using nix-lib
-          apps = utilityApps // {
-            coverage-unit = {
-              type = "app";
-              program = toString (
-                pkgs.writeShellScript "coverage-unit" ''
-                  nix build -L .#bloklid-coverage -o coverage.lcov
-                ''
-              );
-            };
-          };
+          apps = utilityApps;
 
           # Export packages
           packages = packages // {

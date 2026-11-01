@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS source (
     events        text[],
     enabled       boolean     NOT NULL DEFAULT true,
     discovered_by text,
+    managed_by_config boolean NOT NULL DEFAULT false,
     created_at    timestamptz NOT NULL DEFAULT now(),
     CHECK (indexed_to >= from_block - 1)
 );

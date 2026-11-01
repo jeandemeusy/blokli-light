@@ -1,45 +1,56 @@
 ---
 services:
-  postgres:
-    image: postgres:18-alpine@sha256:1d22739c0a64fae400b80b9b7bc66c793915541c6a65977bbe9b8c88d22b3569 # pinned 2026-06-01, see https://hub.docker.com/layers/library/postgres/18-alpine/images/sha256-bbf8ecc4093dbbaacfc9d62548ca728d33d6d5a6ad236017b6c611e32b5d7cfb
-    container_name: bloklid-postgres
-    environment:
-      POSTGRES_USER: bloklid
-      POSTGRES_PASSWORD: bloklid_dev_password
-      POSTGRES_DB: bloklid
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+  anvil:
+    image: ghcr.io/foundry-rs/foundry:latest
+    entrypoint: ["anvil"]
+    command: ["--host", "0.0.0.0", "--chain-id", "31337"]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U bloklid"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-    networks:
-      - bloklid-network
-  bloklid:
-    # image built locally:
-    image: bloklid:latest # Built from: nix build .#bloklid-docker && docker load < result or from
-    # image from registry (uncomment the following line and comment the previous one):
-    # image: europe-west3-docker.pkg.dev/hoprassociation/docker-images/bloklid:latest
-    container_name: bloklid
+      test: ["CMD", "cast", "block-number", "--rpc-url", "http://127.0.0.1:8545"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: blokli_light
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-blokli_light_dev}
+      POSTGRES_USER: blokli_light
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U blokli_light -d blokli_light"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - postgres-data:/var/lib/postgresql
+
+  deploy-contracts:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    entrypoint: ["/usr/local/bin/blokli-contract-deployer"]
+    command: ["--rpc-url", "http://anvil:8545"]
     depends_on:
+      anvil:
+        condition: service_healthy
+
+  blokli-light:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    depends_on:
+      deploy-contracts:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
     environment:
-      RUST_LOG: info,blokli_chain_indexer=debug
-    volumes:
-      - ./config-docker.toml:/config.toml:ro
-      - bloklid_data:/data
-    ports:
-      - "8080:8080"
-    command: ["-c", "/config.toml"]
-    networks:
-      - bloklid-network
+      BLOKLI_LIGHT_DATABASE_URL: postgresql://blokli_light:${POSTGRES_PASSWORD:-blokli_light_dev}@postgres:5432/blokli_light
+      BLOKLI_LIGHT_NETWORK: ${BLOKLI_LIGHT_NETWORK:-anvil-localhost}
+      BLOKLI_LIGHT_READER_PASSWORD: ${BLOKLI_LIGHT_READER_PASSWORD:-blokli_reader_dev}
+      BLOKLI_LIGHT_RPC_URL: ${BLOKLI_LIGHT_RPC_URL:-http://anvil:8545}
+      BLOKLI_LIGHT_LOG_FORMAT: json
+      RUST_LOG: ${RUST_LOG:-info}
     restart: unless-stopped
+
 volumes:
-  postgres_data:
-  bloklid_data:
-networks:
-  bloklid-network:
-    driver: bridge
+  postgres-data:

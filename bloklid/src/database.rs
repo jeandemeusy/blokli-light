@@ -1,6 +1,6 @@
-use std::fmt;
+use std::{collections::BTreeSet, fmt};
 
-use sqlx::{PgPool, Postgres, pool::PoolConnection, postgres::PgPoolOptions};
+use sqlx::{AssertSqlSafe, PgPool, Postgres, pool::PoolConnection, postgres::PgPoolOptions};
 use thiserror::Error;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -149,7 +149,18 @@ impl fmt::Debug for Database {
 impl Database {
     /// Opens a PostgreSQL pool without applying migrations.
     pub async fn connect(database_url: &str) -> Result<Self, DatabaseError> {
-        let pool = PgPoolOptions::new().connect(database_url).await?;
+        Self::connect_with_max_connections(database_url, 5).await
+    }
+
+    /// Opens a PostgreSQL pool with an explicit connection limit.
+    pub async fn connect_with_max_connections(database_url: &str, max_connections: u32) -> Result<Self, DatabaseError> {
+        if max_connections == 0 {
+            return Err(DatabaseError::ZeroMaxConnections);
+        }
+        let pool = PgPoolOptions::new()
+            .max_connections(max_connections)
+            .connect(database_url)
+            .await?;
         Ok(Self { pool })
     }
 
@@ -270,6 +281,43 @@ impl Database {
         row.try_into()
     }
 
+    /// Returns the number of raw log rows currently retained.
+    pub async fn log_count(&self) -> Result<u64, DatabaseError> {
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM log")
+            .fetch_one(&self.pool)
+            .await?;
+        from_bigint("log count", count)
+    }
+
+    /// Records the database chain identity on first start and refuses later mismatches.
+    pub async fn ensure_chain_identity(&self, network: &str, chain_id: u64) -> Result<(), DatabaseError> {
+        let chain_id = to_bigint("chain_id", chain_id)?;
+        let existing = sqlx::query_as::<_, ChainIdentityRow>("SELECT network, chain_id FROM chain_info WHERE id = 1")
+            .fetch_one(&self.pool)
+            .await?;
+        match (existing.network, existing.chain_id) {
+            (Some(stored_network), Some(stored_chain_id))
+                if stored_network != network || stored_chain_id != chain_id =>
+            {
+                Err(DatabaseError::ChainIdentityMismatch {
+                    stored_network,
+                    stored_chain_id,
+                    configured_network: network.to_owned(),
+                    configured_chain_id: chain_id,
+                })
+            }
+            (Some(_), Some(_)) => Ok(()),
+            _ => {
+                sqlx::query("UPDATE chain_info SET network = $1, chain_id = $2, updated_at = now() WHERE id = 1")
+                    .bind(network)
+                    .bind(chain_id)
+                    .execute(&self.pool)
+                    .await?;
+                Ok(())
+            }
+        }
+    }
+
     /// Inserts or reconciles a source from bindings or operator configuration.
     ///
     /// Reconciliation never discards indexed data. Moving `from_block` earlier resets
@@ -291,9 +339,10 @@ impl Database {
         let source = sqlx::query_as::<_, SourceRow>(
             "INSERT INTO source (name, address, kind, from_block, indexed_to, events) VALUES ($1, $2, $3, $4, $4 - 1, \
              $5) ON CONFLICT (name) DO UPDATE SET kind = EXCLUDED.kind, from_block = LEAST(source.from_block, \
-             EXCLUDED.from_block), indexed_to = CASE WHEN EXCLUDED.from_block < source.from_block THEN \
-             LEAST(source.indexed_to, EXCLUDED.from_block - 1) ELSE source.indexed_to END, events = EXCLUDED.events, \
-             enabled = true RETURNING id, name, address, kind, from_block, indexed_to, events, enabled",
+             EXCLUDED.from_block), indexed_to = CASE WHEN EXCLUDED.from_block < source.from_block OR source.events IS \
+             DISTINCT FROM EXCLUDED.events THEN LEAST(source.indexed_to, LEAST(source.from_block, \
+             EXCLUDED.from_block) - 1) ELSE source.indexed_to END, events = EXCLUDED.events, enabled = true RETURNING \
+             id, name, address, kind, from_block, indexed_to, events, enabled",
         )
         .bind(&source.name)
         .bind(source.address.as_slice())
@@ -308,7 +357,39 @@ impl Database {
         .fetch_one(&self.pool)
         .await?;
 
+        sqlx::query("SELECT pg_notify('blokli_light_sources', $1)")
+            .bind(&source.name)
+            .execute(&self.pool)
+            .await?;
+
         source.try_into()
+    }
+
+    /// Reconciles a declarative source and records its ownership by the configuration file.
+    pub async fn upsert_config_source(&self, source: &NewSource) -> Result<Source, DatabaseError> {
+        let source = self.upsert_source(source).await?;
+        sqlx::query("UPDATE source SET managed_by_config = true WHERE id = $1")
+            .bind(source.id)
+            .execute(&self.pool)
+            .await?;
+        Ok(source)
+    }
+
+    /// Disables declarative sources removed from the current configuration without deleting logs.
+    pub async fn disable_removed_config_sources(&self, configured_names: &[String]) -> Result<u64, DatabaseError> {
+        let result = sqlx::query(
+            "UPDATE source SET enabled = false WHERE kind = 'custom' AND managed_by_config = true AND NOT (name = \
+             ANY($1)) AND enabled = true",
+        )
+        .bind(configured_names)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() > 0 {
+            sqlx::query("SELECT pg_notify('blokli_light_sources', 'config-reconciled')")
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(result.rows_affected())
     }
 
     /// Adds events to a custom source and resets its watermark for an idempotent re-backfill.
@@ -328,6 +409,11 @@ impl Database {
         .await?
         .ok_or_else(|| DatabaseError::CustomSourceNotFound(name.to_owned()))?;
 
+        sqlx::query("SELECT pg_notify('blokli_light_sources', $1)")
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+
         source.try_into()
     }
 
@@ -342,6 +428,11 @@ impl Database {
             return Err(DatabaseError::CustomSourceNotFound(name.to_owned()));
         }
 
+        sqlx::query("SELECT pg_notify('blokli_light_sources', $1)")
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+
         Ok(())
     }
 
@@ -355,6 +446,116 @@ impl Database {
         .into_iter()
         .map(TryInto::try_into)
         .collect()
+    }
+
+    /// Primes and verifies the raw-log origin guard.
+    ///
+    /// Built-in rows must match exactly once the guard exists. Custom rows are additive and do
+    /// not invalidate a database when operators register new sources.
+    pub async fn ensure_logs_origin(&self) -> Result<(), DatabaseError> {
+        let sources = self.list_sources().await?;
+        let mut expected_all = BTreeSet::new();
+        let mut expected_builtin = BTreeSet::new();
+        let builtin_addresses = sources
+            .iter()
+            .filter(|source| source.kind == SourceKind::Builtin)
+            .map(|source| source.address.to_vec())
+            .collect::<BTreeSet<_>>();
+
+        for source in sources.iter().filter(|source| source.enabled) {
+            let topics = match &source.events {
+                Some(events) => events
+                    .iter()
+                    .map(|event| decode_topic(event))
+                    .collect::<Result<Vec<_>, _>>()?,
+                None => vec![vec![0; 32]],
+            };
+            for topic in topics {
+                let pair = (source.address.to_vec(), topic);
+                if source.kind == SourceKind::Builtin {
+                    expected_builtin.insert(pair.clone());
+                }
+                expected_all.insert(pair);
+            }
+        }
+
+        let existing = sqlx::query_as::<_, LogTopicRow>("SELECT address, topic FROM log_topic_info")
+            .fetch_all(&self.pool)
+            .await?;
+        let existing_builtin = existing
+            .iter()
+            .filter(|row| builtin_addresses.contains(&row.address))
+            .map(|row| (row.address.clone(), row.topic.clone()))
+            .collect::<BTreeSet<_>>();
+        if !existing.is_empty() && existing_builtin != expected_builtin {
+            return Err(DatabaseError::LogsOriginMismatch);
+        }
+
+        let mut transaction = self.pool.begin().await?;
+        for (address, topic) in expected_all {
+            sqlx::query(
+                "INSERT INTO log_topic_info (address, topic) VALUES ($1, $2) ON CONFLICT (address, topic) DO NOTHING",
+            )
+            .bind(address)
+            .bind(topic)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    /// Marks logs from replaced versions of one block as removed without deleting history.
+    pub async fn mark_noncanonical_logs_removed(
+        &self,
+        block_number: u64,
+        canonical_hash: &[u8; 32],
+    ) -> Result<u64, DatabaseError> {
+        let result = sqlx::query(
+            "UPDATE log SET removed = true WHERE block_number = $1 AND block_hash <> $2 AND removed = false",
+        )
+        .bind(to_bigint("block_number", block_number)?)
+        .bind(canonical_hash.as_slice())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Creates or updates the restricted PostgreSQL login used by direct SQL consumers.
+    pub async fn provision_reader(&self, user: &str, password: &str) -> Result<(), DatabaseError> {
+        if !is_valid_role_name(user) {
+            return Err(DatabaseError::InvalidReaderRole(user.to_owned()));
+        }
+        let role = quote_identifier(user);
+        let password = quote_literal(password);
+        let database: String = sqlx::query_scalar("SELECT current_database()")
+            .fetch_one(&self.pool)
+            .await?;
+        let database = quote_identifier(&database);
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname = $1)")
+            .bind(user)
+            .fetch_one(&self.pool)
+            .await?;
+        let role_statement = if exists {
+            format!("ALTER ROLE {role} LOGIN PASSWORD {password} CONNECTION LIMIT 10")
+        } else {
+            format!("CREATE ROLE {role} LOGIN PASSWORD {password} CONNECTION LIMIT 10")
+        };
+        sqlx::query(AssertSqlSafe(role_statement)).execute(&self.pool).await?;
+        for statement in [
+            format!("GRANT CONNECT ON DATABASE {database} TO {role}"),
+            format!("GRANT USAGE ON SCHEMA public TO {role}"),
+            format!("REVOKE CREATE ON SCHEMA public FROM {role}"),
+            format!("GRANT SELECT ON ALL TABLES IN SCHEMA public TO {role}"),
+            format!("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO {role}"),
+            format!("ALTER ROLE {role} SET default_transaction_read_only = on"),
+            format!("ALTER ROLE {role} SET statement_timeout = '60s'"),
+            format!("ALTER ROLE {role} SET idle_in_transaction_session_timeout = '30s'"),
+            format!("ALTER ROLE {role} SET search_path = public"),
+        ] {
+            sqlx::query(AssertSqlSafe(statement)).execute(&self.pool).await?;
+        }
+        Ok(())
     }
 
     async fn store_logs_in_transaction(
@@ -421,6 +622,18 @@ struct ChainInfoRow {
     head_block: Option<i64>,
 }
 
+#[derive(sqlx::FromRow)]
+struct ChainIdentityRow {
+    network: Option<String>,
+    chain_id: Option<i64>,
+}
+
+#[derive(sqlx::FromRow)]
+struct LogTopicRow {
+    address: Vec<u8>,
+    topic: Vec<u8>,
+}
+
 impl TryFrom<ChainInfoRow> for ChainInfo {
     type Error = DatabaseError;
 
@@ -479,6 +692,31 @@ fn from_bigint(name: &'static str, value: i64) -> Result<u64, DatabaseError> {
     u64::try_from(value).map_err(|_| DatabaseError::InvalidStoredBlockNumber(name, value))
 }
 
+fn decode_topic(topic: &str) -> Result<Vec<u8>, DatabaseError> {
+    let topic = topic
+        .strip_prefix("0x")
+        .ok_or_else(|| DatabaseError::InvalidStoredTopic(topic.to_owned()))?;
+    let bytes = hex::decode(topic).map_err(|_| DatabaseError::InvalidStoredTopic(topic.to_owned()))?;
+    if bytes.len() != 32 {
+        return Err(DatabaseError::InvalidStoredTopic(topic.to_owned()));
+    }
+    Ok(bytes)
+}
+
+fn is_valid_role_name(role: &str) -> bool {
+    let mut characters = role.chars();
+    matches!(characters.next(), Some(character) if character.is_ascii_alphabetic() || character == '_')
+        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
+fn quote_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+fn quote_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
 /// Guard retaining the PostgreSQL session that owns the daemon writer lock.
 pub struct AdvisoryLock {
     connection: PoolConnection<Postgres>,
@@ -510,6 +748,9 @@ impl AdvisoryLock {
 /// Errors produced by the PostgreSQL storage layer.
 #[derive(Debug, Error)]
 pub enum DatabaseError {
+    /// A PostgreSQL pool must retain at least one connection.
+    #[error("database max_connections must be greater than zero")]
+    ZeroMaxConnections,
     /// A source name must contain non-whitespace characters.
     #[error("source name cannot be empty")]
     EmptySourceName,
@@ -525,6 +766,30 @@ pub enum DatabaseError {
     /// A source batch was committed for a source that is disabled or absent.
     #[error("enabled source '{0}' was not found")]
     EnabledSourceNotFound(String),
+    /// Stored origin rows disagree with the configured built-in contract/topic set.
+    #[error("configured built-in log origin does not match this database")]
+    LogsOriginMismatch,
+    /// A persisted source topic is not a complete 32-byte hash.
+    #[error("stored source topic is invalid: {0}")]
+    InvalidStoredTopic(String),
+    /// The configured RPC/network differs from the identity already stored in the database.
+    #[error(
+        "database belongs to {stored_network} chain {stored_chain_id}, not {configured_network} chain \
+         {configured_chain_id}"
+    )]
+    ChainIdentityMismatch {
+        /// Previously stored network.
+        stored_network: String,
+        /// Previously stored chain ID.
+        stored_chain_id: i64,
+        /// Requested network.
+        configured_network: String,
+        /// Requested chain ID.
+        configured_chain_id: i64,
+    },
+    /// Reader role names are restricted to ordinary PostgreSQL identifiers.
+    #[error("invalid reader role name: {0}")]
+    InvalidReaderRole(String),
     /// A source row has an invalid persisted address width.
     #[error("stored source address must be 20 bytes, got {0}")]
     InvalidSourceAddressLength(usize),

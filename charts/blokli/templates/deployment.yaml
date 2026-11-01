@@ -1,154 +1,55 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "blokli.fullname" . }}
-  annotations:
-    argocd.argoproj.io/sync-wave: "3"
-    {{- with .Values.deploymentAnnotations }}
-    {{- toYaml . | nindent 4 }}
-    {{- end }}
-  labels:
-    {{- include "blokli.labels" . | nindent 4 }}
-    {{- if and .Values.networkPolicy.enabled .Values.networkPolicy.ingressPrometheus.enabled }}
-    network-policy.hoprnet.org/prometheus-scrape-port: {{ .Values.service.port | quote }}
-    {{- end }}
+  name: {{ include "blokli-light.fullname" . }}
 spec:
-  replicas: 1
-  {{- with .Values.updateStrategy }}
+  replicas: {{ .Values.replicaCount }}
   strategy:
-    {{- toYaml . | nindent 4 }}
-  {{- end }}
+    type: Recreate
   selector:
     matchLabels:
-      {{- include "blokli.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/name: {{ include "blokli-light.name" . }}
   template:
     metadata:
-      annotations:
-        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
-        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
-        {{- with .Values.podAnnotations }}
-        {{- toYaml . | nindent 8 }}
-        {{- end }}
       labels:
-        {{- include "blokli.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/name: {{ include "blokli-light.name" . }}
     spec:
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      serviceAccountName: {{ include "blokli.serviceAccountName" . }}-sa
-      securityContext:
-        {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
-      - name: bloklid
-        securityContext:
-          {{- toYaml .Values.securityContext | nindent 10 }}
-        image: {{ include "blokli.image" . }}
-        imagePullPolicy: {{ include "blokli.imagePullPolicy" . }}
-        args:
-          - --config
-          - /etc/blokli/config.toml
-        ports:
-        - name: http
-          containerPort: {{ .Values.service.port }}
-          protocol: TCP
-        env:
-        - name: RUST_LOG
-          value: {{ .Values.config.logging.level | quote }}
-        - name: RUST_BACKTRACE
-          value: {{ .Values.config.logging.backtrace | quote }}
-        - name: BLOKLI_LOG_FORMAT
-          value: {{ .Values.config.logging.format | quote }}
-        {{- with .Values.extraEnv }}
-        {{- toYaml . | nindent 8 }}
-        {{- end }}
-        envFrom:
-        - secretRef:
-            name: {{ include "blokli.fullname" . }}
-        {{- if .Values.database.existingSecret }}
-        - secretRef:
-            name: {{ .Values.database.existingSecret }}
-        {{- end }}
-        {{- if .Values.livenessProbe.enabled }}
-        livenessProbe:
-          httpGet:
-            path: /healthz
-            port: http
-          initialDelaySeconds: {{ .Values.livenessProbe.initialDelaySeconds }}
-          periodSeconds: {{ .Values.livenessProbe.periodSeconds }}
-          timeoutSeconds: {{ .Values.livenessProbe.timeoutSeconds }}
-          successThreshold: {{ .Values.livenessProbe.successThreshold }}
-          failureThreshold: {{ .Values.livenessProbe.failureThreshold }}
-        {{- end }}
-        {{- if .Values.readinessProbe.enabled }}
-        readinessProbe:
-          httpGet:
-            path: /readyz
-            port: http
-          initialDelaySeconds: {{ .Values.readinessProbe.initialDelaySeconds }}
-          periodSeconds: {{ .Values.readinessProbe.periodSeconds }}
-          timeoutSeconds: {{ .Values.readinessProbe.timeoutSeconds }}
-          successThreshold: {{ .Values.readinessProbe.successThreshold }}
-          failureThreshold: {{ .Values.readinessProbe.failureThreshold }}
-        {{- end }}
-        {{- if .Values.startupProbe.enabled }}
-        startupProbe:
-          httpGet:
-            path: /healthz
-            port: http
-          initialDelaySeconds: {{ .Values.startupProbe.initialDelaySeconds }}
-          periodSeconds: {{ .Values.startupProbe.periodSeconds }}
-          timeoutSeconds: {{ .Values.startupProbe.timeoutSeconds }}
-          successThreshold: {{ .Values.startupProbe.successThreshold }}
-          failureThreshold: {{ .Values.startupProbe.failureThreshold }}
-        {{- end }}
-        resources:
-        {{- if .Values.resources -}}
-          {{- toYaml .Values.resources | nindent 10 }}
-        {{- else }}
-          limits:
-            cpu: 2000m
-            memory: 4Gi
-          requests:
-            cpu: 500m
-            memory: 1Gi
-        {{- end }}
-        volumeMounts:
-        - name: config
-          mountPath: /etc/blokli
-          readOnly: true
-        {{- if .Values.persistence.enabled }}
-        - name: data
-          mountPath: {{ .Values.config.dataDirectory }}
-        {{- end }}
-        - name: tmp
-          mountPath: /tmp
-        {{- with .Values.extraVolumeMounts }}
-        {{- toYaml . | nindent 8 }}
-        {{- end }}
+        - name: blokli-light
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["--config", "/etc/blokli-light/config.toml"]
+          env:
+            - name: BLOKLI_LIGHT_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ default (include "blokli-light.fullname" .) .Values.database.existingSecret }}
+                  key: {{ .Values.database.urlKey }}
+            - name: BLOKLI_LIGHT_RPC_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ default (include "blokli-light.fullname" .) .Values.rpc.existingSecret }}
+                  key: {{ .Values.rpc.urlKey }}
+            {{- if or .Values.reader.password .Values.reader.existingSecret }}
+            - name: BLOKLI_LIGHT_READER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ default (include "blokli-light.fullname" .) .Values.reader.existingSecret }}
+                  key: {{ .Values.reader.passwordKey }}
+            {{- end }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/blokli-light
+              readOnly: true
+          resources: {{ toYaml .Values.resources | nindent 12 }}
       volumes:
-      - name: config
-        configMap:
-          name: {{ include "blokli.fullname" . }}
-      {{- if .Values.persistence.enabled }}
-      - name: data
-        persistentVolumeClaim:
-          claimName: {{ include "blokli.fullname" . }}
-      {{- end }}
-      - name: tmp
-        emptyDir: {}
-      {{- with .Values.extraVolumes }}
-      {{- toYaml . | nindent 6 }}
-      {{- end }}
-      {{- with .Values.nodeSelector }}
-      nodeSelector:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.affinity }}
-      affinity:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.tolerations }}
-      tolerations:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+        - name: config
+          configMap:
+            name: {{ include "blokli-light.fullname" . }}
+      nodeSelector: {{ toYaml .Values.nodeSelector | nindent 8 }}
+      tolerations: {{ toYaml .Values.tolerations | nindent 8 }}
+      affinity: {{ toYaml .Values.affinity | nindent 8 }}

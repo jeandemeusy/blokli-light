@@ -1,382 +1,60 @@
-# ============================================================================
-# Default Command
-# ============================================================================
+# Run these recipes from `nix develop`, as described in AGENTS.md.
 
-# Nix's Darwin shell can provide an empty target-specific DEVELOPER_DIR and an
-# lld flag that conflict with its Apple SDK wrapper. Preserve the normal Cargo
-# environment on every other host.
-cargo_native := if os() == "macos" {
-    "env -u CARGO_BUILD_RUSTFLAGS -u DEVELOPER_DIR_arm64_apple_darwin -u DEVELOPER_DIR_x86_64_apple_darwin cargo"
-} else {
-    "cargo"
-}
-
-# Show available commands
 default:
     @just --list
 
-# ============================================================================
-# Quick Workflows
-# ============================================================================
+# Required fast validation: format, lint every target, and compile the workspace.
+quick: fmt clippy check
 
-# Quick check - format, clippy, and check
-quick: fmt clippy check export-generated-schemas
+# Full local development gate.
+dev: quick test
 
-# Development build and test cycle - format, check, and test
-dev: fmt check test export-generated-schemas
-
-# Watch for changes and run checks continuously
-watch:
-    cargo watch -x "check --workspace" -x "test -p bloklid"
-
-# ============================================================================
-# Build Commands
-# ============================================================================
-
-# Build all workspace packages in debug mode
-build:
-    cargo build --workspace
-
-# Build all workspace packages in release mode with full optimizations
-build-release:
-    cargo build --workspace --release
-
-# Check all workspace code without building binaries
-check:
-    cargo check --workspace
-
-# Clean all build artifacts
-clean:
-    cargo clean
-
-
-# ============================================================================
-# Test Commands
-# ============================================================================
-
-# Run all tests in workspace
-test:
-    cargo test --workspace --no-fail-fast
-
-# Run tests for a specific package
-test-package package:
-    cargo test -p {{ package }} --no-fail-fast
-
-# Check that the SeaORM entities match the schema the migrations build on PostgreSQL.
-# Starts a throwaway PostgreSQL server unless BLOKLI_TEST_POSTGRES_URL already points at one.
-test-postgres-schema:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if [ -z "${BLOKLI_TEST_POSTGRES_URL:-}" ]; then
-        pg_dir=$(mktemp -d "${TMPDIR:-/tmp}/blokli_pg.XXXXXX")
-        trap 'pg_ctl -D "$pg_dir/data" -m immediate stop >/dev/null 2>&1 || true; rm -rf "$pg_dir"' EXIT
-        initdb -D "$pg_dir/data" -U postgres --auth=trust --locale=C --encoding=UTF8 >/dev/null
-        pg_ctl -D "$pg_dir/data" -l "$pg_dir/postgres.log" -o "-k $pg_dir -c listen_addresses='' -p 5433" -w start >/dev/null
-        export BLOKLI_TEST_POSTGRES_URL="postgres://postgres@localhost:5433/postgres?host=$pg_dir"
-    fi
-    {{ cargo_native }} test -p blokli-db --test postgres_schema_test -- --ignored
-
-# Run tests in single thread mode with output (useful for debugging)
-test-debug:
-    cargo test --workspace -- --test-threads=1 --nocapture
-
-# Run tests for a specific package with execution time reported
-test-profile package:
-    nix develop .#experiment -c cargo test -p {{ package }} --no-fail-fast -- -Z unstable-options --report-time
-
-# Run all tests in workspace using nextest
-nextest:
-    cargo nextest run --workspace
-
-# Run tests for a specific package using nextest
-nextest-package package:
-    cargo nextest run -p {{ package }}
-
-# Run system tests (full smoke test suite)
-system-test: smoke-test-full
-
-# ============================================================================
-# Code Quality
-# ============================================================================
-
-# Format all code with the treefmt wrapper provided by the dev shell
 fmt:
     treefmt
 
-# Run clippy lints with warnings as errors
-clippy:
-    cargo clippy --workspace --all-features -- -D warnings
+check:
+    cargo check --workspace --all-targets
 
-# Run clippy on all targets (lib, bin, tests, benches, examples)
-clippy-all:
+clippy:
     cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-# Automatically fix clippy warnings
-clippy-fix:
-    cargo clippy --workspace --fix --allow-dirty --allow-staged
+test:
+    cargo test --workspace --no-fail-fast
 
-# Run ast-grep to check import organization and code style rules
-lint-imports:
-    ast-grep scan
+build:
+    cargo build --workspace
 
-# ============================================================================
-# Run Commands - bloklid daemon
-# ============================================================================
+build-release:
+    cargo build --workspace --release
 
-# Run bloklid daemon in debug mode with default configuration
-run:
-    cargo run --bin bloklid
+run *args:
+    cargo run --bin blokli-light -- {{ args }}
 
-# Run bloklid daemon with custom configuration file
-run-config config_path:
-    cargo run --bin bloklid -- -c {{ config_path }}
+status *args:
+    cargo run --bin blokli-light -- {{ args }} status
 
-# Run bloklid daemon in release mode with full optimizations
-run-release:
-    cargo run --release --bin bloklid -F runtime-tokio
+migrate *args:
+    cargo run --bin blokli-light -- {{ args }} migrate
 
-# Run bloklid in debug mode against jura-dev network with log output
-run-local-jura-dev:
-    cargo run -p bloklid -- -c config.toml | tee jura-dev.logs
-
-# Run bloklid daemon with SQLite database (local testing)
-run-sqlite:
-    cargo run --bin bloklid -- -c config-sqlite.toml
-
-# Clean SQLite database files (removes both index and logs databases)
-clean-sqlite:
-    rm -f data/bloklid-index.db data/bloklid-logs.db
-    @echo "SQLite databases removed"
-
-# ============================================================================
-# Run Commands - blokli-api server
-# ============================================================================
-
-# Run blokli-api server in debug mode
-run-api:
-    cargo run --bin blokli-api
-
-# Run blokli-api server in release mode with full optimizations
-run-api-release:
-    cargo run --release --bin blokli-api
-
-# Export GraphQL schema to file (requires database URL)
-export-schema database_url output="schema.graphql":
-    {{ cargo_native }} run --bin blokli-api -- export-schema -d {{ database_url }} -o {{ output }}
-
-# Export GraphQL schema using SQLite database
-export-schema-sqlite output="schema.graphql":
+# Run PostgreSQL-backed storage and reader-permission tests in an isolated cluster.
+test-postgres:
     #!/usr/bin/env bash
     set -euo pipefail
-    # Create data directory if it doesn't exist
-    mkdir -p data
-    # Run migrations to create/update the database schema
-    # Note: ?mode=rwc allows SQLite to create the database file if it doesn't exist
-    {{ cargo_native }} run --bin migration -- up -u "sqlite://data/bloklid-index.db?mode=rwc"
-    # Export the GraphQL schema
-    {{ cargo_native }} run --bin blokli-api -- export-schema -d "sqlite://data/bloklid-index.db" -o {{ output }}
-    echo "GraphQL schema exported to {{ output }}"
+    pg_dir=$(mktemp -d "${TMPDIR:-/tmp}/blokli-light-pg.XXXXXX")
+    trap 'pg_ctl -D "$pg_dir/data" -m immediate stop >/dev/null 2>&1 || true; rm -rf "$pg_dir"' EXIT
+    initdb -D "$pg_dir/data" -U postgres --auth=trust --locale=C --encoding=UTF8 >/dev/null
+    pg_ctl -D "$pg_dir/data" -l "$pg_dir/postgres.log" -o "-k $pg_dir -c listen_addresses=''" -w start >/dev/null
+    export BLOKLI_LIGHT_TEST_DATABASE_URL="postgresql://postgres@localhost/postgres?host=$pg_dir"
+    cargo test -p blokli-light --test postgres -- --ignored --test-threads=1
 
-# Export the checked-in GraphQL API contract using an isolated SQLite database
-export-target-api-schema output="design/target-api-schema.graphql":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/blokli_api_schema_export.XXXXXX")
-    tmp_db="$tmp_dir/blokli.db"
-    trap 'rm -f "$tmp_db"; rmdir "$tmp_dir"' EXIT
-    {{ cargo_native }} run --bin migration -- up -u "sqlite://${tmp_db}?mode=rwc"
-    {{ cargo_native }} run --bin blokli-api -- export-schema -d "sqlite://${tmp_db}" -o {{ output }}
-    echo "Target GraphQL schema exported to {{ output }}"
-
-
-# Export database schema (DDL) using SQLite for tracking schema changes
-export-db-schema output="design/db-schema.sql":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/blokli_schema_export.XXXXXX")
-    tmp_db="$tmp_dir/blokli.db"
-    trap 'rm -f "$tmp_db"; rmdir "$tmp_dir"' EXIT
-    # Run migrations on a temporary SQLite database
-    {{ cargo_native }} run --bin migration -- up -u "sqlite://${tmp_db}?mode=rwc"
-    # Query sqlite_schema directly. Sort order: tables (0) → views (1) → indexes (2), then by name.
-    sqlite3 "$tmp_db" "SELECT sql || ';' || CHAR(10) FROM sqlite_schema WHERE type IN ('table', 'view', 'index') AND name NOT GLOB 'seaql*' AND name NOT GLOB 'sqlite_*' AND sql IS NOT NULL ORDER BY CASE type WHEN 'table' THEN 0 WHEN 'view' THEN 1 WHEN 'index' THEN 2 ELSE 3 END, name;" | pg_format > {{ output }}
-    echo "Database schema exported to {{ output }}"
-
-# Regenerate all checked-in schema documents
-export-generated-schemas: export-db-schema export-target-api-schema
-    
-# ============================================================================
-# Documentation
-# ============================================================================
-
-# Generate and open documentation for workspace packages only
 doc:
-    cargo doc --no-deps -F runtime-tokio --open
+    cargo doc --workspace --no-deps --open
 
-# Generate and open documentation including all dependencies
-doc-all:
-    cargo doc -F runtime-tokio --open
-
-# ============================================================================
-# Dependency Management
-# ============================================================================
-
-# Update all dependencies to latest compatible versions
-update:
-    cargo update
-
-# Show outdated dependencies that have newer versions available
-outdated:
-    cargo outdated
-
-# Check for unused dependencies
-cargo-udeps:
-    nix develop .#experiment -c bash -c 'cargo udeps'
-
-# ============================================================================
-# Docker Compose Commands
-# ============================================================================
-
-# Start PostgreSQL and bloklid with Docker Compose
 docker-up:
-    docker-compose -f docker/docker-compose.yml up -d
+    docker compose -f docker/docker-compose.yml up --build
 
-# Stop Docker Compose services
 docker-down:
-    docker-compose -f docker/docker-compose.yml down
+    docker compose -f docker/docker-compose.yml down
 
-# Stop and remove all data (WARNING: destroys database)
-docker-down-volumes:
-    docker-compose -f docker/docker-compose.yml down -v
-
-# View Docker Compose logs (optionally specify service name)
-docker-logs service="":
-    #!/usr/bin/env bash
-    if [ -z "{{ service }}" ]; then
-        docker-compose -f docker/docker-compose.yml logs -f
-    else
-        docker-compose -f docker/docker-compose.yml logs -f {{ service }}
-    fi
-
-# Build bloklid Docker image from Nix
 docker-build:
-    nix build .#docker-bloklid-x86_64-linux
-    docker load < result
-
-# Build bloklid + anvil Docker image from Nix
-docker-build-anvil:
-    nix build .#docker-bloklid-anvil-x86_64-linux
-    docker load < result
-
-# Run bloklid + anvil container (GraphQL API on port 8080)
-docker-run-anvil log_level="info":
-    docker run --rm -p 8080:8080 -e RUST_LOG={{ log_level }} bloklid-anvil:latest
-
-# Rebuild bloklid and restart Docker Compose
-docker-restart: docker-build
-    docker-compose -f docker/docker-compose.yml down
-    docker-compose -f docker/docker-compose.yml up -d
-
-# Connect to PostgreSQL database with psql
-docker-db:
-    docker-compose -f docker/docker-compose.yml exec postgres psql -U bloklid -d bloklid
-
-# Reset database (WARNING: deletes all data)
-docker-db-reset:
-    docker-compose -f docker/docker-compose.yml down -v
-    docker-compose -f docker/docker-compose.yml up -d postgres
-    @echo "Waiting for PostgreSQL to be ready..."
-    @sleep 5
-    docker-compose -f docker/docker-compose.yml up -d bloklid
-
-# Show database tables
-docker-db-tables:
-    docker-compose -f docker/docker-compose.yml exec postgres psql -U bloklid -d bloklid -c "\\dt"
-
-# Backup database to file
-docker-db-backup file="backup.sql":
-    docker-compose -f docker/docker-compose.yml exec -T postgres pg_dump -U bloklid bloklid > {{ file }}
-    @echo "Database backed up to {{ file }}"
-
-# Restore database from file
-docker-db-restore file="backup.sql":
-    docker-compose -f docker/docker-compose.yml exec -T postgres psql -U bloklid -d bloklid < {{ file }}
-    @echo "Database restored from {{ file }}"
-
-# Generate SVG for target db schema
-generate-target-db-schema-svg:
-    docker run --rm -u $(id -u):$(id -g) -v ./design:/data \
-      ghcr.io/mermaid-js/mermaid-cli/mermaid-cli \
-      -i target-db-schema.mmd -o target-db-schema.svg
-    @echo "SVG stored at ./design/target-db-schema.svg"
-
-# ============================================================================
-# Helm Chart Commands
-# ============================================================================
-
-# Template Helm chart to YAML files
-helm-template:
-    helm template blokli ./charts/blokli -f ./charts/blokli/values-testing.yaml
-
-# Lint Helm chart for issues
-helm-lint:
-    helm lint ./charts/blokli -f ./charts/blokli/values-testing.yaml
-
-# Generate Helm chart README from values.yaml
-helm-docs:
-    bunx @bitnami/readme-generator-for-helm --values ./charts/blokli/values.yaml --readme ./charts/blokli/README.md --schema "/tmp/schema.json"
-
-# Package Helm chart for distribution
-helm-package:
-    helm package ./charts/blokli
-
-# Authenticate with Google Artifact Registry for Helm
-helm-login:
-    #!/usr/bin/env bash
-    gcloud auth print-access-token | helm registry login -u oauth2accesstoken --password-stdin europe-west3-docker.pkg.dev
-
-# Push Helm chart to Google Artifact Registry
-helm-push:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    version=$(yq -r '.version' ./charts/blokli/Chart.yaml)
-    helm push "blokli-${version}.tgz" oci://europe-west3-docker.pkg.dev/hoprassociation/helm-charts
-
-# ============================================================================
-# Smoke Tests
-# ============================================================================
-
-# Run smoke tests with Docker Compose (PostgreSQL + Anvil) - includes checkpoint resume validation
-smoke-test:
-    ./tests/smoke/run-smoke-test.sh
-
-# Verify that the standard Anvil image deploys Curvy v2 and exposes it through the API
-smoke-test-curvy:
-    ./tests/smoke/run-curvy-smoke-test.sh
-
-# Run smoke tests against Gnosis Chain RPC (allows high lag) - includes checkpoint resume validation
-smoke-test-gnosis:
-    SMOKE_CONFIG=config-smoke-gnosis.toml ./tests/smoke/run-smoke-test.sh
-
-# Run smoke tests against Gnosis Chain RPC with full sync (requires indexer to catch up within 10 blocks) - includes checkpoint resume validation
-smoke-test-gnosis-full-sync:
-    SMOKE_CONFIG=config-smoke-gnosis-full-sync.toml ./tests/smoke/run-smoke-test.sh
-
-# Run Gnosis Chain full sync smoke test and keep services running for inspection
-smoke-test-gnosis-full-sync-up:
-    KEEP_RUNNING=1 SMOKE_CONFIG=config-smoke-gnosis-full-sync.toml ./tests/smoke/run-smoke-test.sh
-
-# Stop and remove the Gnosis Chain full sync smoke stack
-smoke-test-gnosis-full-sync-down:
-    docker compose -f tests/smoke/docker-compose.yml down -v
-
-# ============================================================================
-# Helper Commands
-# ============================================================================
-
-# Decode a packed channel state bytes32 hex string
-decode-channel hex:
-    cargo run --bin blokli-helper -- decode-channel {{ hex }}
-
-# Build Docker image and run all smoke tests (Anvil + Gnosis Chain connectivity + Gnosis Chain full sync) - all include checkpoint resume validation
-smoke-test-full: smoke-test smoke-test-gnosis smoke-test-gnosis-full-sync
+    nix build -L .#docker-bloklid-x86_64-linux

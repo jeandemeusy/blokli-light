@@ -59,13 +59,14 @@ downstream concerns.
 2. The follower reads the RPC head, subtracts configured confirmations, and retrieves finalised logs for caught-up enabled sources.
 3. A backfill worker independently fetches sources whose `indexed_to` has not reached the built-in watermark. Its lower priority avoids
    delaying head tracking.
-4. Each completed batch writes raw logs and advances the relevant source and/or global watermark in one PostgreSQL transaction. A successful
-   global commit emits `blokli_light_head` through `pg_notify`.
+4. Each completed source batch writes raw logs and advances that source in one PostgreSQL transaction. After every built-in source reaches
+   the same finalised head, a separate compatibility-watermark transaction advances `chain_info` and emits `blokli_light_head` through
+   `pg_notify`. A crash between those commits only causes an idempotent refetch; it cannot skip logs.
 5. A restart reconciliation window re-fetches recent finalised blocks. Replaced block hashes overwrite conflicting positions; logs no longer
    present in a replaced block are marked `removed`, never hard-deleted.
 
-RPC log queries adapt their block range after provider limit errors. The follower chunks source addresses when a provider cannot accept them
-in one filter, and advances a shared range only after all chunks succeed.
+RPC log queries learn and retain a smaller block range after provider limit errors. Sources are queried independently, which preserves each
+source's event filter and naturally avoids provider address-list limits.
 
 ## Security and Operations
 
@@ -74,5 +75,6 @@ read-only transactions, a bounded connection count, statement timeout, and idle-
 unrelated schemas.
 
 Status is available through the `indexer_status` SQL view and the daemon CLI. `chain_info` records network identity, RPC head, and the
-built-in watermark, allowing consumers to calculate lag without an API. OTLP telemetry remains the integration point for metrics, traces,
-and logs. An optional health endpoint may be added later, but is disabled by default and is not a query API.
+built-in watermark, allowing consumers to calculate lag without an API. Structured text or JSON logs use the standard `RUST_LOG` filter.
+Optional OTLP export sends metrics, traces, and logs to a configured collector; the two daemon gauges expose the observed RPC head and
+committed finalised watermark. No inbound HTTP endpoint is required.

@@ -1,11 +1,18 @@
 //! Minimal JSON-RPC client for the reads required by the raw-log indexer.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use reqwest::Client;
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use thiserror::Error;
+use tokio::{sync::Mutex, time::sleep};
 use url::Url;
 
 use crate::{database::RawLog, source::format_address};
@@ -24,16 +31,24 @@ pub struct LogFilter {
 }
 
 /// HTTP JSON-RPC client with a learned `eth_getLogs` block-range limit.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct RpcClient {
     client: Client,
     url: Url,
-    next_request_id: AtomicU64,
+    next_request_id: Arc<AtomicU64>,
+    learned_log_range: Arc<AtomicU64>,
+    request_interval: Option<Duration>,
+    next_request_at: Arc<Mutex<Instant>>,
 }
 
 impl RpcClient {
     /// Creates an RPC client for an HTTP(S) endpoint.
     pub fn new(rpc_url: &str) -> Result<Self, RpcError> {
+        Self::new_with_rate_limit(rpc_url, 0)
+    }
+
+    /// Creates an RPC client with an optional maximum requests-per-second rate.
+    pub fn new_with_rate_limit(rpc_url: &str, max_requests_per_second: u32) -> Result<Self, RpcError> {
         let url = Url::parse(rpc_url).map_err(RpcError::InvalidUrl)?;
         if !matches!(url.scheme(), "http" | "https") {
             return Err(RpcError::UnsupportedUrlScheme(url.scheme().to_owned()));
@@ -42,8 +57,33 @@ impl RpcClient {
         Ok(Self {
             client: Client::new(),
             url,
-            next_request_id: AtomicU64::new(1),
+            next_request_id: Arc::new(AtomicU64::new(1)),
+            learned_log_range: Arc::new(AtomicU64::new(0)),
+            request_interval: (max_requests_per_second > 0)
+                .then(|| Duration::from_secs_f64(1.0 / f64::from(max_requests_per_second))),
+            next_request_at: Arc::new(Mutex::new(Instant::now())),
         })
+    }
+
+    /// Applies the smallest provider range limit learned by this process.
+    pub fn log_block_range(&self, configured_maximum: u64) -> u64 {
+        let learned = self.learned_log_range.load(Ordering::Relaxed);
+        if learned == 0 {
+            configured_maximum
+        } else {
+            configured_maximum.min(learned)
+        }
+    }
+
+    /// Records a provider rejection so later source batches avoid repeating it.
+    pub fn note_log_range_limit(&self, rejected_range: u64) -> u64 {
+        let reduced = rejected_range.div_ceil(2).max(1);
+        let _ = self
+            .learned_log_range
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                (current == 0 || reduced < current).then_some(reduced)
+            });
+        self.log_block_range(reduced)
     }
 
     /// Returns the current chain height without applying finality.
@@ -56,6 +96,15 @@ impl RpcClient {
     pub async fn chain_id(&self) -> Result<u64, RpcError> {
         let chain_id: String = self.call("eth_chainId", json!([])).await?;
         parse_quantity(&chain_id)
+    }
+
+    /// Returns the canonical hash for a block number.
+    pub async fn block_hash(&self, block_number: u64) -> Result<[u8; 32], RpcError> {
+        let block: Option<RpcBlock> = self
+            .call("eth_getBlockByNumber", json!([format_quantity(block_number), false]))
+            .await?;
+        let block = block.ok_or(RpcError::BlockNotFound(block_number))?;
+        parse_fixed_hex(&block.hash)
     }
 
     /// Returns whether an address has contract code at the current chain head.
@@ -95,6 +144,7 @@ impl RpcClient {
     }
 
     async fn call<T: DeserializeOwned>(&self, method: &str, params: Value) -> Result<T, RpcError> {
+        self.wait_for_rate_limit().await;
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let response = self
             .client
@@ -119,6 +169,32 @@ impl RpcClient {
         }
 
         response.result.ok_or(RpcError::MissingResult)
+    }
+
+    async fn wait_for_rate_limit(&self) {
+        let Some(interval) = self.request_interval else {
+            return;
+        };
+        let mut next_request_at = self.next_request_at.lock().await;
+        let now = Instant::now();
+        if *next_request_at > now {
+            sleep(*next_request_at - now).await;
+        }
+        *next_request_at = Instant::now() + interval;
+    }
+}
+
+impl RpcError {
+    /// Whether the provider rejected an `eth_getLogs` range or response size.
+    pub fn is_log_range_limit(&self) -> bool {
+        match self {
+            Self::Response { code, message } => {
+                matches!(*code, -32005 | -32016)
+                    || message.to_ascii_lowercase().contains("range")
+                    || message.to_ascii_lowercase().contains("too many results")
+            }
+            _ => false,
+        }
     }
 }
 
@@ -147,6 +223,11 @@ struct RpcLog {
     log_index: String,
     #[serde(default)]
     removed: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcBlock {
+    hash: String,
 }
 
 impl TryFrom<RpcLog> for RawLog {
@@ -253,11 +334,14 @@ pub enum RpcError {
         /// Inclusive last block.
         to_block: u64,
     },
+    /// A block expected below the finalised head was absent.
+    #[error("block {0} was not returned by the RPC")]
+    BlockNotFound(u64),
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{RpcError, format_quantity, parse_fixed_hex, parse_quantity};
+    use super::{RpcClient, RpcError, format_quantity, parse_fixed_hex, parse_quantity};
 
     #[test]
     fn parses_rpc_quantities() {
@@ -280,5 +364,15 @@ mod tests {
             parse_fixed_hex::<2>("0x00"),
             Err(RpcError::InvalidHexLength { .. })
         ));
+    }
+
+    #[test]
+    fn retains_the_smallest_provider_log_range() {
+        let client = RpcClient::new("http://localhost:8545").expect("valid RPC URL");
+        assert_eq!(client.log_block_range(10_000), 10_000);
+        assert_eq!(client.note_log_range_limit(10_000), 5_000);
+        assert_eq!(client.note_log_range_limit(8_000), 4_000);
+        assert_eq!(client.log_block_range(10_000), 4_000);
+        assert_eq!(client.log_block_range(2_000), 2_000);
     }
 }
