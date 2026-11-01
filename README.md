@@ -98,8 +98,9 @@ Optional OTLP export supports gRPC and HTTP collectors without opening an inboun
 
 ### Docker image and VPS deployment
 
-CI builds the image for `linux/amd64` and `linux/arm64`. Pull requests validate it without publishing; pushes to `main` publish `latest`,
-`main`, and an immutable `sha-<commit>` tag to GitHub Container Registry. A Git tag such as `v0.1.0` also publishes an image with that tag.
+CI builds the image for `linux/amd64`, suitable for a standard x86-64 Linux VPS. Pull requests validate it without publishing; pushes to
+`main` publish `latest`, `main`, and an immutable `sha-<commit>` tag to GitHub Container Registry. A Git tag such as `v0.1.0` also publishes
+an image with that tag.
 
 ```bash
 docker pull ghcr.io/jeandemeusy/blokli-light:latest

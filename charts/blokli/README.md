@@ -2,7 +2,7 @@
 
 This chart runs the raw-log daemon only. It has no Service or Ingress because blokli-light exposes no HTTP API. Supply PostgreSQL and RPC URLs directly or through existing Secrets; the pod uses PostgreSQL advisory locking to prevent concurrent writers.
 
-CI publishes multi-architecture images to `ghcr.io/jeandemeusy/blokli-light`. Deploy an immutable commit or release tag:
+CI publishes `linux/amd64` images to `ghcr.io/jeandemeusy/blokli-light`. Deploy an immutable commit or release tag:
 
 ```bash
 helm upgrade --install blokli-light charts/blokli \
