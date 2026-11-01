@@ -1,30 +1,31 @@
 [package]
 authors     = ["HOPR Association <tech@hoprnet.org>"]
-description = "Daemon for indexing HOPR on-chain events and executing HOPR-related on-chain transactions"
+autobins    = false
+description = "PostgreSQL raw-log indexer for HOPR and operator-defined contracts"
 edition     = "2024"
 homepage    = "https://hoprnet.org/"
 license     = "GPL-3.0-only"
-name        = "bloklid"
-repository  = "https://github.com/hoprnet/hoprnet"
-version     = "0.14.3"
+name        = "blokli-light"
+repository  = "https://github.com/jeandemeusy/blokli-light"
+version     = "0.1.0"
 
-[features]
-curvy-test-deployment = ["dep:curvy-bindings"]
-default = ["curvy-test-deployment", "runtime-tokio"]
-runtime-tokio = [
-  "blokli-chain-api/runtime-tokio",
-  "blokli-chain-indexer/runtime-tokio",
-  "blokli-chain-rpc/runtime-tokio",
-  "blokli-db/runtime-tokio",
-]
-telemetry = ["blokli-api/telemetry"]
+[lints]
+workspace = true
+
+[[bin]]
+name = "blokli-light"
+path = "src/main.rs"
+
+[[bin]]
+name = "blokli-contract-deployer"
+path = "src/bin/blokli-contract-deployer.rs"
 
 [dependencies]
-async-signal = { workspace = true }
-axum = { workspace = true }
+alloy-primitives = "1.7.3"
+anyhow = { workspace = true }
 clap = { workspace = true }
-flagset = { workspace = true }
-futures = { workspace = true }
+hex = { workspace = true }
+hopr-bindings = { workspace = true }
 humantime-serde = { workspace = true }
 opentelemetry = { workspace = true, features = ["logs", "metrics", "trace"] }
 opentelemetry-otlp = { workspace = true, features = [
@@ -37,10 +38,8 @@ opentelemetry-otlp = { workspace = true, features = [
   "tls-roots",
   "trace",
 ] }
-opentelemetry-prometheus-text-exporter = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = [
   "experimental_logs_batch_log_processor_with_async_runtime",
-  "experimental_metrics_custom_reader",
   "experimental_metrics_periodicreader_with_async_runtime",
   "experimental_trace_batch_span_processor_with_async_runtime",
   "logs",
@@ -48,48 +47,18 @@ opentelemetry_sdk = { workspace = true, features = [
   "rt-tokio",
   "trace",
 ] }
+reqwest = { workspace = true, features = ["json"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_with = { workspace = true }
-smart-default = { workspace = true }
-strum = { workspace = true }
-tempfile = { workspace = true }
+sqlx = { workspace = true, features = ["migrate"] }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-opentelemetry = { workspace = true }
-tracing-subscriber = { workspace = true, features = ["json"] }
+tracing-subscriber = { workspace = true }
 url = { workspace = true }
-validator = { workspace = true }
-
-# Local dependencies
-blokli-api           = { workspace = true }
-blokli-chain-api     = { workspace = true, features = ["telemetry"] }
-blokli-chain-indexer = { workspace = true }
-blokli-chain-rpc     = { workspace = true }
-blokli-chain-types   = { workspace = true }
-blokli-db            = { workspace = true }
-
-# HOPR dependencies
-config = { workspace = true }
-curvy-bindings = { workspace = true, optional = true }
-hopr-bindings = { workspace = true }
-hopr-types = { workspace = true, features = [
-  "chain",
-  "crypto",
-  "internal",
-  "primitive",
-  "telemetry",
-] }
 
 [dev-dependencies]
-anyhow      = { workspace = true }
-async-trait = { workspace = true }
-temp-env    = { workspace = true }
-thiserror   = { workspace = true }
-tokio       = { workspace = true, features = ["full"] }
-validator   = { workspace = true }
-
-[package.metadata.cargo-machete]
-ignored = ["humantime-serde"]
+mockito = "1.7.2"
+tokio   = { workspace = true, features = ["rt-multi-thread"] }

@@ -1,243 +1,27 @@
-# Testing Guide
+# Testing blokli-light
 
-This document provides comprehensive guidance for testing the Blokli indexer and API, with special focus on temporal queries, blockchain
-reorganization handling, and edge cases.
-
-## Table of Contents
-
-- [Running Tests](#running-tests)
-- [Test Organization](#test-organization)
-- [Writing New Tests](#writing-new-tests)
-- [Continuous Integration](#continuous-integration)
-- [Troubleshooting](#troubleshooting)
-- [Additional Resources](#additional-resources)
-
-## Running Tests
-
-### Quick Test Commands
+Run all project commands inside `nix develop`.
 
 ```bash
-# Run all tests (requires nix develop shell)
-just test
-
-# Run tests for a specific package
-just test-package blokli-db
-
-# Run with debug output (single-threaded, shows println!)
-just test-debug
-
-# Run specific test by name
-cargo test test_get_channel_state_at -F runtime-tokio -- --nocapture
-```
-
-### Manual API Testing (no Docker required)
-
-For interactive exploration — GraphQL playground, manual subscription testing via curl, quick iteration on API behaviour — you can run a
-local stack without building a Docker image.
-
-**Terminal 1 — Anvil:**
-
-```bash
-anvil --host 0.0.0.0 --port 8545 --block-time 1
-```
-
-**Terminal 2 — Deploy contracts, then start bloklid:**
-
-```bash
-# Deploy HOPR contracts and write their addresses to a TOML fragment
-cargo run --bin blokli-contract-deployer -- --output /tmp/contracts-deploy.toml
-
-# Append the [contracts] section to the SQLite config
-cat /tmp/contracts-deploy.toml >> config-sqlite.toml
-
-# Start bloklid with SQLite backend
-just run-sqlite
-```
-
-The GraphQL playground is available at `http://localhost:8080/graphiql` once bloklid is running.
-
-**Clean up between runs:**
-
-```bash
-just clean-sqlite   # removes data/bloklid-index.db and data/bloklid-logs.db
-```
-
-Also remove the `[contracts]` block appended to `config-sqlite.toml` before redeploying, or the file will accumulate duplicate sections.
-
-### Post-Test Workflow
-
-Always run the quick check after making changes:
-
-```bash
-just quick  # Runs fmt, clippy, and check
-```
-
-## Test Organization
-
-### Unit Tests
-
-Unit tests are co-located with the code they test using `#[cfg(test)]` modules:
-
-### Integration Tests
-
-Integration tests are in `bloklid/tests/`:
-
-- **`indexer_startup_test.rs`**: End-to-end indexer tests
-  - Indexer startup and shutdown
-  - Fast sync mode
-  - Start block configuration
-  - Mock RPC integration
-
-### PostgreSQL Schema Check
-
-Most tests run on SQLite, which hides type mismatches that only fail on PostgreSQL when a row is decoded (for example an `i64` entity field
-over an `INTEGER` column). `db/core/tests/postgres_schema_test.rs` migrates a scratch PostgreSQL database and compares every SeaORM entity
-against `information_schema`.
-
-```bash
-# Starts a throwaway PostgreSQL server, or uses BLOKLI_TEST_POSTGRES_URL if set
-just test-postgres-schema
-```
-
-When you add an entity, list it in `all_entities` in that test; the test fails if a table or view has no entity.
-
-## Writing New Tests
-
-### Test Structure
-
-Follow this structure for new tests:
-
-```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use blokli_db::db::BlokliDb;
-    use blokli_db_entity::codegen::{channel, channel_state};
-    use sea_orm::{ActiveValue, EntityTrait, ActiveModelTrait};
-
-    #[tokio::test]
-    async fn test_your_feature() -> anyhow::Result<()> {
-        // 1. Setup: Create in-memory database
-        let db = BlokliDb::new_in_memory().await?;
-
-        // 2. Arrange: Create test data
-        let test_data = create_test_data(&db).await?;
-
-        // 3. Act: Perform operation under test
-        let result = function_under_test(&db, test_data).await?;
-
-        // 4. Assert: Verify results
-        assert_eq!(result.expected_field, expected_value);
-
-        Ok(())
-    }
-}
-```
-
-### Best Practices
-
-1. **Use `anyhow::Result<()>`** for test return types
-2. **Prefer `new_in_memory()`** for unit tests (faster, isolated)
-3. **Use descriptive test names** that explain what is being tested
-4. **Test both success and error paths**
-5. **Clean up resources** (though in-memory DBs are automatically cleaned up)
-6. **Use `#[tokio::test]`** for async tests
-7. **Add `-- --nocapture`** to see `println!` output during debugging
-8. **Document complex test scenarios** with comments
-
-### Common Patterns
-
-#### Testing with Mock Data
-
-```rust
-#[tokio::test]
-async fn test_with_mock_data() -> anyhow::Result<()> {
-    let db = BlokliDb::new_in_memory().await?;
-
-    // Create mock blockchain position
-    let position = BlockPosition {
-        block: 1000,
-        tx_index: 5,
-        log_index: 3,
-    };
-
-    // Insert test state
-    let state = channel_state::ActiveModel {
-        channel_id: ActiveValue::Set(channel_id),
-        balance: ActiveValue::Set(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]),
-        published_block: ActiveValue::Set(position.block as i64),
-        published_tx_index: ActiveValue::Set(position.tx_index as i64),
-        published_log_index: ActiveValue::Set(position.log_index as i64),
-        // ... other fields
-        ..Default::default()
-    };
-
-    state.insert(db.conn(TargetDb::Index)).await?;
-
-    Ok(())
-}
-```
-
-#### Testing Error Conditions
-
-```rust
-#[tokio::test]
-async fn test_error_handling() -> anyhow::Result<()> {
-    let db = BlokliDb::new_in_memory().await?;
-
-    // Test with invalid ID
-    let result = get_channel_state_at(
-        &db.conn(TargetDb::Index),
-        -1,  // Invalid channel ID
-        BlockPosition { block: 1000, tx_index: 0, log_index: 0 }
-    ).await?;
-
-    // Should return None for non-existent channel
-    assert!(result.is_none());
-
-    Ok(())
-}
-```
-
-## Continuous Integration
-
-Tests run automatically in CI pipelines. Ensure all tests pass before submitting PRs:
-
-```bash
-# Run full test suite
-just test
-
-# Run formatting and linting
 just quick
-
-# Generate documentation
-just doc
+just test
+just test-postgres
 ```
 
-## Troubleshooting
+`just quick` formats the tree, runs Clippy with warnings denied for all targets, and checks compilation. `just test` runs the unit suite.
+`just test-postgres` starts an isolated PostgreSQL cluster and verifies migration compatibility, duplicate idempotency, reorg replacement,
+the origin guard, and read-only role permissions.
 
-### Tests Failing Locally
+The end-to-end acceptance test uses an Anvil chain: deploy the HOPR contracts, emit representative channel, announcement, and oracle events,
+register a custom ERC-20 after it has emitted transfers, and verify both its historical backfill and live following.
 
-1. Ensure you're in the nix develop shell: `nix develop`
-2. Clean build artifacts: `cargo clean`
-3. Rebuild: `just build`
-4. Run tests with output: `just test-debug`
+Final parity is measured against the original Blokli over the same real-network range:
 
-### Slow Tests
+```sql
+SELECT block_number, tx_index, log_index, address, topics, data
+FROM log
+ORDER BY 1, 2, 3;
+```
 
-- Use `new_in_memory()` instead of file-based databases
-- Reduce dataset sizes in performance tests
-- Run specific tests instead of full suite
-
-### Flaky Tests
-
-- Check for race conditions in concurrent operations
-- Ensure proper cleanup between test runs
-- Use deterministic random data (seeded RNG)
-
-## Additional Resources
-
-- [SeaORM Testing Guide](https://www.sea-ql.org/SeaORM/docs/write-test/testing/)
-- [Tokio Testing Documentation](https://tokio.rs/tokio/topics/testing)
-- Design documents in `/design` directory
-- Module documentation in source files
+The result must match byte-for-byte for the built-in contract set. The Arrakis `gnosis-vpn.json` bundle must then produce the same query
+results through the provisioned reader role.

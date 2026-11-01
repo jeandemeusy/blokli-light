@@ -1,323 +1,44 @@
 erDiagram
-    account {
-        bigint keyid PK "Custom incremental unique identifier, Primary key"
-        binary(20) chain_key UK "Chain key (40-character hex string in bytes, UNIQUE, NOT NULL)"
-        binary(32) packet_key "Packet key (NOT NULL)"
-        binary(8) published_block "Published block (original u64 stored in bytes to preserve precision, NOT NULL)"
-        binary(8) published_tx_index "Published tx index (original u64 stored in bytes to preserve precision, NOT NULL)"
-        binary(8) published_log_index "Published log index (original u64 stored in bytes to preserve precision, NOT NULL)"
-    }
-
-    account_state {
-        int id PK "Primary key, autoincrement"
-        bigint account_id FK "Foreign key to account.keyid (NOT NULL)"
-        binary(20) safe_address "key to hopr safe (40-character hex string in bytes, NULL)"
-        binary(8) published_block "Published block (original u64 stored in bytes to preserve precision, NOT NULL)"
-        binary(8) published_tx_index "Published tx index (original u64 stored in bytes to preserve precision, NOT NULL)"
-        binary(8) published_log_index "Published log index (original u64 stored in bytes to preserve precision, NOT NULL)"
-    }
-    %% Composite unique constraint: UNIQUE(account_id, published_block, published_tx_index, published_log_index)
-    %% Index: idx_account_state_position (account_id, published_block DESC, published_tx_index DESC, published_log_index DESC)
-
-    announcement {
-        int id PK "Primary key"
-        bigint account_keyid FK "Foreign key to account keyid (NOT NULL)"
-        string multiaddress "Multiaddress (NOT NULL)"
-        binary(8) published_block "Published block (original u64 stored in bytes to preserve precision, NOT NULL)"
-        binary(8) published_tx_index "Published tx index (original u64 stored in bytes to preserve precision, NOT NULL)"
-        binary(8) published_log_index "Published log index (original u64 stored in bytes to preserve precision, NOT NULL)"
-    }
-    %% Index: idx_announcement_position (published_block, published_tx_index, published_log_index)
-
-    channel {
-        int id PK "Primary key"
-        binary(32) concrete_channel_id UK "Unique channel identifier (64-character hex string in bytes, NOT NULL)"
-        bigint source_account_keyid FK "Source account (Foreign key to account.keyid, NOT NULL)"
-        bigint destination_account_keyid FK "Destination account (Foreign key to account.keyid, NOT NULL)"
-    }
-
-    channel_state {
-        int id PK "Primary key, autoincrement"
-        bigint channel_id FK "Foreign key to channel.id (NOT NULL)"
-        binary(12) balance "Channel balance (original u96 stored in bytes to preserve precision, NOT NULL)"
-        int status "Channel status (NOT NULL)"
-        binary(3) epoch "Epoch (original u24 stored in bytes to preserve precision, NOT NULL, default is 1)"
-        binary(6) ticket_index "Ticket index (original u48 stored in bytes to preserve precision, NOT NULL, default is 0)"
-        datetime closure_time "Closure timestamp (NULL)"
-        bool corrupted_state "Corrupted state flag (NOT NULL, default is false)"
-        binary(8) published_block "Published block (original u64 stored in bytes to preserve precision, NOT NULL)"
-        binary(8) published_tx_index "Published tx index (original u64 stored in bytes to preserve precision, NOT NULL)"
-        binary(8) published_log_index "Published log index (original u64 stored in bytes to preserve precision, NOT NULL)"
-    }
-    %% Composite unique constraint: UNIQUE(channel_id, published_block, published_tx_index, published_log_index)
-    %% Index: idx_channel_state_position (channel_id, published_block DESC, published_tx_index DESC, published_log_index DESC)
-    %% Index: idx_channel_state_status (status)
-
-    hopr_balance {
-        int id PK "Primary key"
-        binary(20) address UK "Unique address (40-character hex string in bytes, NOT NULL)"
-        bigint account_keyid FK UK "Foreign key to account.keyid (UNIQUE, enforces 0..1)"
-        binary(32) balance "wxHOPR token balance (original u256 stored in bytes to preserve precision, NOT NULL)"
-        binary(8) last_changed_block "Last changed block (original u64 stored in bytes to preserve precision, NOT NULL)"
-        binary(8) last_changed_tx_index "Last changed tx index (original u64 stored in bytes to preserve precision, NOT NULL)"
-        binary(8) last_changed_log_index "Last changed log index (original u64 stored in bytes to preserve precision, NOT NULL)"
-    }
-
-    native_balance {
-        int id PK "Primary key"
-        binary(20) address UK "Unique address (40-character hex string in bytes, NOT NULL)"
-        bigint account_keyid FK UK "Foreign key to account.keyid (UNIQUE, enforces 0..1)"
-        binary(32) balance "Native token balance (original u256 stored in bytes to preserve precision, NOT NULL)"
-        binary(8) last_changed_block "Last changed block (original u64 stored in bytes to preserve precision, NOT NULL)"
-        binary(8) last_changed_tx_index "Last changed tx index (original u64 stored in bytes to preserve precision, NOT NULL)"
-        binary(8) last_changed_log_index "Last changed log index (original u64 stored in bytes to preserve precision, NOT NULL)"
-    }
-
     chain_info {
-        int id PK "Primary key"
-        binary(8) last_indexed_block "Last indexed block (original u64 stored in bytes to preserve precision)"
-        binary(8) last_indexed_tx_index "Last indexed tx index (original u64 stored in bytes to preserve precision)"
-        binary(8) last_indexed_log_index "Last indexed log index (original u64 stored in bytes to preserve precision)"
-        binary(12) ticket_price "Ticket price"
-        binary(32) channels_dst "Channels destination"
-        binary(32) ledger_dst "Ledger destination"
-        binary(32) safe_registry_dst "Safe registry destination"
-        double min_incoming_ticket_win_prob "Min incoming ticket win probability"
-        bigint channel_closure_grace_period "Channel closure grace period in seconds (NULL)"
+        bigint id PK
+        bigint last_indexed_block
+        bigint last_indexed_tx_index
+        bigint last_indexed_log_index
+        text network
+        bigint chain_id
+        bigint head_block
+        timestamptz updated_at
     }
-
+    source {
+        bigint id PK
+        text name UK
+        bytea address UK
+        text kind
+        bigint from_block
+        bigint indexed_to
+        text_array events
+        boolean enabled
+        text discovered_by
+        boolean managed_by_config
+        timestamptz created_at
+    }
     log {
-        int id PK "Primary key"
-        binary(8) block "block number (original u64 stored in bytes to preserve precision, NOT NULL)"
-        binary(8) tx_index "tx index (original u64 stored in bytes to preserve precision, NOT NULL)"
-        binary(8) log_index "log index (original u64 stored in bytes to preserve precision, NOT NULL)"
-        binary(32) block_hash "Block hash (NOT NULL)"
-        binary(32) transaction_hash "Transaction hash (NOT NULL)"
-        binary(20) address "Address (40-character hex string in bytes, NOT NULL)"
-        binary(32)[] topics "Topics (array of 0..4 items, each 32 bytes; NOT NULL)"
-        binary data "Data (variable length bytes, NOT NULL)"
-        bool removed "Removed flag (default is false)"
+        bigint id PK
+        bigint tx_index
+        bigint log_index
+        bigint block_number
+        bytea block_hash
+        bytea transaction_hash
+        bytea address
+        bytea topics
+        bytea data
+        boolean removed
     }
-    %% Composite unique constraint: UNIQUE(block, tx_index, log_index)
-
-    log_status {
-        int id PK "Primary key"
-        int log_id FK UK "Foreign key to log (UNIQUE, enforces 1:0..1, NOT NULL)"
-        bool processed "Processed flag (default is false)"
-        datetime processed_at "Processing timestamp"
-        binary(32) checksum "Checksum"
-    }
-
     log_topic_info {
-        int id PK "Primary key"
-        binary(20) address "Address (40-character hex string in bytes, NOT NULL)"
-        binary(32) topic "Topic hash (32 bytes; NOT NULL)"
+        bigint id PK
+        bytea address
+        bytea topic
     }
 
-    hopr_safe_contract {
-        int id PK "Primary key"
-        binary(20) address UK "Unique contract address (40-character hex string in bytes, NOT NULL)"
-        binary(8) deployed_block "block number (original u64 stored in bytes to preserve precision, NOT NULL)"
-        binary(8) deployed_tx_index "tx index (original u64 stored in bytes to preserve precision, NOT NULL)"
-        binary(8) deployed_log_index "log index (original u64 stored in bytes to preserve precision, NOT NULL)"
-    }
-
-    hopr_safe_owner_state {
-        int id PK "Primary key"
-        bigint hopr_safe_contract_id FK "Foreign key to hopr_safe_contract.id (NOT NULL)"
-        binary(20) owner_address "Owner address (40-character hex string in bytes, NOT NULL)"
-        bool is_current_owner "Whether this event makes the owner active or inactive (NOT NULL)"
-        bigint published_block "Published block (NOT NULL)"
-        bigint published_tx_index "Published tx index (NOT NULL)"
-        bigint published_log_index "Published log index (NOT NULL)"
-    }
-    %% Composite unique constraint: UNIQUE(hopr_safe_contract_id, owner_address, published_block, published_tx_index, published_log_index)
-    %% Index: idx_safe_owner_state_current_lookup (hopr_safe_contract_id, owner_address, published_block DESC, published_tx_index DESC, published_log_index DESC)
-    %% Index: idx_safe_owner_state_owner_lookup (owner_address, published_block DESC, published_tx_index DESC, published_log_index DESC)
-
-    hopr_safe_event {
-        int id PK "Primary key"
-        bigint hopr_safe_contract_id FK "Foreign key to hopr_safe_contract.id (NOT NULL)"
-        string event_kind "Safe event type (SAFE_SETUP, ADDED_OWNER, REMOVED_OWNER, CHANGED_THRESHOLD, EXECUTION_SUCCESS, EXECUTION_FAILURE)"
-        binary(32) chain_tx_hash "Containing chain transaction hash (NOT NULL)"
-        bigint published_block "Published block (NOT NULL)"
-        bigint published_tx_index "Published tx index (NOT NULL)"
-        bigint published_log_index "Published log index (NOT NULL)"
-    }
-    %% Composite unique constraint: UNIQUE(hopr_safe_contract_id, published_block, published_tx_index, published_log_index)
-    %% Index: idx_safe_event_safe_position (hopr_safe_contract_id, published_block DESC, published_tx_index DESC, published_log_index DESC)
-    %% Index: idx_safe_event_chain_tx_hash (chain_tx_hash)
-
-    hopr_safe_setup_event {
-        bigint hopr_safe_event_id PK, FK "Foreign key to hopr_safe_event.id (NOT NULL)"
-        binary(20) initiator_address "Safe setup initiator address (NULL for preseeded data)"
-        string threshold "Setup threshold value encoded as decimal string (NOT NULL)"
-    }
-
-    hopr_safe_setup_owner {
-        int id PK "Primary key"
-        bigint hopr_safe_event_id FK "Foreign key to hopr_safe_setup_event.hopr_safe_event_id (NOT NULL)"
-        bigint owner_position "Owner order inside the SafeSetup event payload (NOT NULL)"
-        binary(20) owner_address "Owner address from the SafeSetup event (NOT NULL)"
-    }
-    %% Composite unique constraint: UNIQUE(hopr_safe_event_id, owner_position)
-    %% Index: idx_safe_setup_owner_event_lookup (hopr_safe_event_id, owner_position)
-
-    hopr_safe_owner_change_event {
-        bigint hopr_safe_event_id PK, FK "Foreign key to hopr_safe_event.id (NOT NULL)"
-        binary(20) owner_address "Owner address added or removed by this event (NOT NULL)"
-    }
-
-    hopr_safe_threshold_change_event {
-        bigint hopr_safe_event_id PK, FK "Foreign key to hopr_safe_event.id (NOT NULL)"
-        string threshold "Threshold value encoded as decimal string (NOT NULL)"
-    }
-
-    hopr_safe_execution_event {
-        bigint hopr_safe_event_id PK, FK "Foreign key to hopr_safe_event.id (NOT NULL)"
-        binary(32) safe_tx_hash "Safe internal transaction hash (NOT NULL)"
-        string payment "Payment value encoded as decimal string (NOT NULL)"
-    }
-    %% Index: idx_safe_execution_safe_tx_hash (safe_tx_hash)
-
-    hopr_safe_threshold_state {
-        int id PK "Primary key"
-        bigint hopr_safe_contract_id FK "Foreign key to hopr_safe_contract.id (NOT NULL)"
-        string threshold "Current-threshold projection value encoded as decimal string (NOT NULL)"
-        bigint published_block "Published block (NOT NULL)"
-        bigint published_tx_index "Published tx index (NOT NULL)"
-        bigint published_log_index "Published log index (NOT NULL)"
-    }
-    %% Composite unique constraint: UNIQUE(hopr_safe_contract_id, published_block, published_tx_index, published_log_index)
-    %% Index: idx_safe_threshold_state_current_lookup (hopr_safe_contract_id, published_block DESC, published_tx_index DESC, published_log_index DESC)
-
-    hopr_safe_redeemed_stats {
-        int id PK "Primary key"
-        binary(20) safe_address "Safe contract address (40-character hex string in bytes, NOT NULL; part of unique (safe_address,node_address) pair)"
-        binary(20) node_address "Destination node address (40-character hex string in bytes, NOT NULL; part of unique (safe_address,node_address) pair)"
-        binary(32) redeemed_amount "Total redeemed amount (original u256 stored in bytes, NOT NULL)"
-        bigint redemption_count "Number of successful ticket redemption events (NOT NULL)"
-        binary(32) rejected_amount "Total rejected amount from failed ticket redemption attempts (original u256 stored in bytes, NOT NULL)"
-        bigint rejection_count "Number of failed ticket redemption attempts (NOT NULL)"
-        bigint last_redeemed_block "Last successful redemption block, or 0 when none has succeeded yet (NOT NULL)"
-        bigint last_redeemed_tx_index "Last successful redemption tx index, or 0 when none has succeeded yet (NOT NULL)"
-        bigint last_redeemed_log_index "Last successful redemption log index, or 0 when none has succeeded yet (NOT NULL)"
-    }
-
-    curvy_note {
-        bigint leaf_index PK "Dense non-zero note-tree position"
-        binary(32) note_id UK "Curvy note commitment"
-        binary(32) batch_index "Commitment batch identifier"
-        bigint published_block "Event block"
-        bigint published_tx_index "Event transaction index"
-        bigint published_log_index "Event log index"
-        bigint item_index "Raw array position, including skipped padding gaps"
-    }
-    %% Composite unique constraint: UNIQUE(published_block, published_tx_index, published_log_index, item_index)
-
-    curvy_tree_checkpoint {
-        bigint id PK "Primary key"
-        bigint published_block "Committed-note log block"
-        bigint published_tx_index "Committed-note log transaction index"
-        bigint published_log_index "Committed-note log index"
-        bigint leaf_count "Dense non-zero leaves included"
-        binary(32) root "Depth-30 Poseidon root"
-        binary frontier "Versioned compact frontier snapshot"
-    }
-    %% Composite unique constraint: UNIQUE(published_block, published_tx_index, published_log_index)
-
-    curvy_shard_root {
-        bigint shard_index PK "Zero-based completed shard index"
-        binary(32) root "Root of 16,384 dense leaves"
-        bigint completed_block "Block that completed the shard"
-        bigint completed_tx_index "Transaction that completed the shard"
-        bigint completed_log_index "Log that completed the shard"
-    }
-
-    service_type {
-        int id PK "Primary key, autoincrement"
-        binary(32) service_type UK "Service type identifier as it appears on-chain (bytes32, UNIQUE, NOT NULL)"
-    }
-
-    service_type_state {
-        int id PK "Primary key, autoincrement"
-        bigint service_type_id FK "Foreign key to service_type.id (NOT NULL)"
-        binary(20) owner_address "Owner of the type, NULL once the type was abandoned"
-        binary(20) requirement_address "Requirement contract gating registration, NULL for an open type"
-        binary(32) registration_burn "wxHOPR burned on self-registration (original u256 stored in bytes, NOT NULL)"
-        binary(32) update_burn "wxHOPR burned on self-update (original u256 stored in bytes, NOT NULL)"
-        bigint published_block "Published block (NOT NULL)"
-        bigint published_tx_index "Published tx index (NOT NULL)"
-        bigint published_log_index "Published log index (NOT NULL)"
-    }
-    %% Composite unique constraint: UNIQUE(service_type_id, published_block, published_tx_index, published_log_index)
-    %% Index: idx_service_type_state_position (service_type_id, published_block DESC, published_tx_index DESC, published_log_index DESC)
-
-    service_entry {
-        int id PK "Primary key, autoincrement"
-        bigint service_type_id FK "Foreign key to service_type.id (NOT NULL)"
-        binary(20) node_address "Node offering the service (NOT NULL). Deliberately not a foreign key: the registry does not require the node to have announced itself, so an entry may exist without an account row"
-    }
-    %% Composite unique constraint: UNIQUE(service_type_id, node_address)
-    %% Index: idx_service_entry_node_address (node_address)
-
-    service_entry_state {
-        int id PK "Primary key, autoincrement"
-        bigint service_entry_id FK "Foreign key to service_entry.id (NOT NULL)"
-        binary(20) safe_address "Safe that performed this write, NULL on a deregistration tombstone"
-        binary(2048) metadata "Opaque metadata capped at the contract's 2048 bytes, NULL on a deregistration tombstone"
-        datetime registered_at "Registration timestamp, NULL on a deregistration tombstone"
-        datetime updated_at "Last update timestamp, NULL on a deregistration tombstone"
-        bool deregistered "Tombstone flag: the entry was removed on-chain (NOT NULL, default is false)"
-        bigint published_block "Published block (NOT NULL)"
-        bigint published_tx_index "Published tx index (NOT NULL)"
-        bigint published_log_index "Published log index (NOT NULL)"
-    }
-    %% Composite unique constraint: UNIQUE(service_entry_id, published_block, published_tx_index, published_log_index)
-    %% Index: idx_service_entry_state_position (service_entry_id, published_block DESC, published_tx_index DESC, published_log_index DESC)
-
-    service_registry_config {
-        int id PK "Primary key, singleton row"
-        binary(32) type_registration_fee "wxHOPR burned to register a new service type (original u256 stored in bytes, NOT NULL, default is zero)"
-        binary(20) node_safe_registry "Node-safe registry the service registry resolves bindings against, NULL until the registry reports it"
-        bigint last_changed_block "Position of the newest config log applied (NOT NULL, default is 0)"
-        bigint last_changed_tx_index "Position of the newest config log applied (NOT NULL, default is 0)"
-        bigint last_changed_log_index "Position of the newest config log applied (NOT NULL, default is 0)"
-    }
-
-    %% ========================================
-    %% RELATIONSHIPS
-    %% ========================================
-
-    account ||--o{ announcement : "has many"
-    account ||--o{ account_state : "has version history"
-    account ||--o| hopr_balance : "has 0 or 1"
-    account ||--o| native_balance : "has 0 or 1"
-    account ||--o{ channel : "source of many"
-    account ||--o{ channel : "destination of many"
-    account ||--o| hopr_safe_contract : "has 0 or 1"
-    hopr_safe_contract ||--o{ hopr_safe_owner_state : "has owner membership history"
-    hopr_safe_contract ||--o{ hopr_safe_event : "has Safe event history headers"
-    hopr_safe_contract ||--o{ hopr_safe_threshold_state : "has threshold state history"
-    hopr_safe_event ||--o| hopr_safe_setup_event : "has 0 or 1 setup payload"
-    hopr_safe_setup_event ||--o{ hopr_safe_setup_owner : "has setup owners"
-    hopr_safe_event ||--o| hopr_safe_owner_change_event : "has 0 or 1 owner-change payload"
-    hopr_safe_event ||--o| hopr_safe_threshold_change_event : "has 0 or 1 threshold-change payload"
-    hopr_safe_event ||--o| hopr_safe_execution_event : "has 0 or 1 execution payload"
-    hopr_safe_contract ||--o{ hopr_safe_redeemed_stats : "has 0 or more (one per safe/node pair)"
-    channel ||--o{ channel_state : "has version history"
-    service_type ||--o{ service_type_state : "has version history"
-    service_type ||--o{ service_entry : "has many entries"
-    service_entry ||--o{ service_entry_state : "has version history"
-    log ||--o| log_status : "has 0 or 1"
-
-    %% ========================================
-    %% VIEWS (for current state queries)
-    %% ========================================
-    %% account_current: Latest account state (account + most recent account_state)
-    %% channel_current: Latest channel state (channel + most recent channel_state)
-    %% safe_owner_current: Latest owner membership state per (safe, owner) where the owner is currently active
-    %% safe_threshold_current: Latest threshold state per safe
-    %% service_type_current: Latest service type state (service_type + most recent service_type_state)
-    %% service_entry_current: Latest registry entry state (service_entry + most recent service_entry_state);
-    %%                        a row with deregistered set is a tombstone and must be filtered out by readers
+    source ||--o{ log : "matches by address"
+    source ||--o{ log_topic_info : "guards address and topic0"

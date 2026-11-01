@@ -1,17 +1,25 @@
+//! Structured local logging and optional OTLP logs, traces, and metrics export.
+
 use std::{
-    collections::HashMap,
-    str::FromStr,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    collections::{HashMap, HashSet},
+    env,
+    error::Error as StdError,
+    fmt::Debug,
+    io::stdout,
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, SystemTime},
 };
 
-use flagset::FlagSet;
-use hopr_types::telemetry as hopr_telemetry;
+use anyhow::{Context, Result, anyhow, bail};
 use opentelemetry::{
-    Key, KeyValue,
+    Key, KeyValue, global,
     logs::{AnyValue, LogRecord as _, Logger as _, LoggerProvider as _, Severity},
     trace::TracerProvider as _,
 };
-use opentelemetry_otlp::{Protocol, WithExportConfig as _};
+use opentelemetry_otlp::{LogExporter, MetricExporter, Protocol, SpanExporter, WithExportConfig as _};
 use opentelemetry_sdk::{
     Resource,
     logs::{SdkLogger, SdkLoggerProvider, log_processor_with_async_runtime::BatchLogProcessor},
@@ -19,17 +27,26 @@ use opentelemetry_sdk::{
     runtime::Tokio,
     trace::{RandomIdGenerator, Sampler, SdkTracerProvider, span_processor_with_async_runtime::BatchSpanProcessor},
 };
-use strum::{Display, EnumString};
-use tracing::field::{Field, Visit};
-use tracing_subscriber::Layer;
+use tracing::{
+    Event, Level,
+    field::{Field, Visit},
+};
+use tracing_subscriber::{
+    EnvFilter, Layer, Registry, fmt,
+    layer::{Context as LayerContext, Identity, SubscriberExt},
+    reload::{Handle as ReloadHandle, Layer as ReloadLayer},
+};
 use url::Url;
 
-use crate::{
-    config::TelemetryConfig,
-    errors::{BloklidError, Result},
-    telemetry_common::{self, OtelBoxedLayer},
-};
+use crate::config::TelemetryConfig;
 
+type BoxedLayer = Box<dyn Layer<Registry> + Send + Sync + 'static>;
+
+static OTLP_HANDLE: OnceLock<ReloadHandle<Vec<BoxedLayer>, Registry>> = OnceLock::new();
+static HEAD_BLOCK: AtomicU64 = AtomicU64::new(0);
+static INDEXED_BLOCK: AtomicU64 = AtomicU64::new(0);
+
+/// Providers kept alive for the lifetime of the daemon and flushed on shutdown.
 #[derive(Default)]
 pub struct TelemetryHandles {
     tracer_provider: Option<SdkTracerProvider>,
@@ -39,47 +56,46 @@ pub struct TelemetryHandles {
 
 impl Drop for TelemetryHandles {
     fn drop(&mut self) {
-        if let Some(tracer_provider) = self.tracer_provider.take() {
-            let _ = tracer_provider.shutdown();
+        if let Some(provider) = self.tracer_provider.take() {
+            let _ = provider.shutdown();
         }
-        if let Some(logger_provider) = self.logger_provider.take() {
-            let _ = logger_provider.shutdown();
+        if let Some(provider) = self.logger_provider.take() {
+            let _ = provider.shutdown();
         }
-        if let Some(meter_provider) = self.meter_provider.take() {
-            let _ = meter_provider.shutdown();
+        if let Some(provider) = self.meter_provider.take() {
+            let _ = provider.shutdown();
         }
     }
 }
 
-flagset::flags! {
-    #[repr(u8)]
-    #[derive(PartialOrd, Ord, EnumString, Display)]
-    pub(crate) enum OtlpSignal: u8 {
-        #[strum(serialize = "traces")]
-        Traces = 0b0000_0001,
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum Signal {
+    Traces,
+    Logs,
+    Metrics,
+}
 
-        #[strum(serialize = "logs")]
-        Logs = 0b0000_0010,
-
-        #[strum(serialize = "metrics")]
-        Metrics = 0b0000_0100,
+impl Signal {
+    const fn path(self) -> &'static str {
+        match self {
+            Self::Traces => "/v1/traces",
+            Self::Logs => "/v1/logs",
+            Self::Metrics => "/v1/metrics",
+        }
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, EnumString, Display)]
-enum OtlpTransport {
-    #[strum(serialize = "grpc")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Transport {
     Grpc,
-
-    #[strum(serialize = "http", serialize = "https")]
     Http,
 }
 
 #[derive(Debug)]
 struct OtlpConfig {
     endpoint: String,
-    transport: OtlpTransport,
-    signals: FlagSet<OtlpSignal>,
+    transport: Transport,
+    signals: HashSet<Signal>,
     metric_export_interval: Duration,
 }
 
@@ -93,23 +109,221 @@ impl OtlpConfig {
         else {
             return Ok(None);
         };
-
-        let transport = infer_otlp_transport(endpoint)?;
+        let transport = infer_transport(endpoint)?;
+        let endpoint = if transport == Transport::Grpc {
+            endpoint.replacen("grpc://", "http://", 1)
+        } else {
+            endpoint.to_owned()
+        };
         Ok(Some(Self {
-            endpoint: normalize_otlp_endpoint(endpoint, transport),
+            endpoint,
             transport,
-            signals: parse_otlp_signals(&config.otlp_signals),
+            signals: parse_signals(&config.otlp_signals)?,
             metric_export_interval: config.metric_export_interval,
         }))
     }
 
-    fn has_signal(&self, signal: OtlpSignal) -> bool {
-        self.signals.contains(signal)
+    fn has(&self, signal: Signal) -> bool {
+        self.signals.contains(&signal)
     }
 
-    fn endpoint_for(&self, signal: OtlpSignal) -> Result<String> {
-        resolve_otlp_endpoint(&self.endpoint, self.transport, signal)
+    fn endpoint_for(&self, signal: Signal) -> Result<String> {
+        if self.transport == Transport::Grpc {
+            return Ok(self.endpoint.clone());
+        }
+        resolve_http_endpoint(&self.endpoint, signal)
     }
+}
+
+/// Installs the local `tracing` subscriber before configuration is loaded.
+pub fn install_base_subscriber() -> Result<()> {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let format = fmt::layer()
+        .with_level(true)
+        .with_target(true)
+        .with_thread_ids(true)
+        .with_writer(stdout);
+    let format = if env::var("BLOKLI_LIGHT_LOG_FORMAT").is_ok_and(|value| value.eq_ignore_ascii_case("json")) {
+        format.json().boxed()
+    } else {
+        format.boxed()
+    };
+    let (reload_layer, handle) = ReloadLayer::new(identity_if_empty(Vec::new()));
+    OTLP_HANDLE
+        .set(handle)
+        .map_err(|_| anyhow!("tracing subscriber was already installed"))?;
+    tracing::subscriber::set_global_default(Registry::default().with(reload_layer).with(filter).with(format))
+        .context("failed to install tracing subscriber")?;
+    Ok(())
+}
+
+/// Configures optional OTLP exporters after the Tokio runtime is available.
+pub fn configure(config: &TelemetryConfig) -> Result<TelemetryHandles> {
+    let Some(config) = OtlpConfig::from_config(config)? else {
+        return Ok(TelemetryHandles::default());
+    };
+    let resource = Resource::builder()
+        .with_service_name(env!("CARGO_PKG_NAME"))
+        .with_attributes([KeyValue::new("service.version", env!("CARGO_PKG_VERSION"))])
+        .build();
+    let mut handles = TelemetryHandles::default();
+    let mut layers = Vec::new();
+
+    if config.has(Signal::Traces) {
+        let exporter = match config.transport {
+            Transport::Grpc => SpanExporter::builder()
+                .with_tonic()
+                .with_protocol(Protocol::Grpc)
+                .with_endpoint(config.endpoint_for(Signal::Traces)?)
+                .build(),
+            Transport::Http => SpanExporter::builder()
+                .with_http()
+                .with_protocol(Protocol::HttpBinary)
+                .with_endpoint(config.endpoint_for(Signal::Traces)?)
+                .build(),
+        }
+        .context("failed to build OTLP trace exporter")?;
+        let provider = SdkTracerProvider::builder()
+            .with_span_processor(BatchSpanProcessor::builder(exporter, Tokio).build())
+            .with_sampler(Sampler::AlwaysOn)
+            .with_id_generator(RandomIdGenerator::default())
+            .with_resource(resource.clone())
+            .build();
+        let tracer = provider.tracer(env!("CARGO_PKG_NAME"));
+        layers.push(tracing_opentelemetry::layer().with_tracer(tracer).boxed());
+        handles.tracer_provider = Some(provider);
+    }
+
+    if config.has(Signal::Logs) {
+        let exporter = match config.transport {
+            Transport::Grpc => LogExporter::builder()
+                .with_tonic()
+                .with_protocol(Protocol::Grpc)
+                .with_endpoint(config.endpoint_for(Signal::Logs)?)
+                .build(),
+            Transport::Http => LogExporter::builder()
+                .with_http()
+                .with_protocol(Protocol::HttpJson)
+                .with_endpoint(config.endpoint_for(Signal::Logs)?)
+                .build(),
+        }
+        .context("failed to build OTLP log exporter")?;
+        let provider = SdkLoggerProvider::builder()
+            .with_log_processor(BatchLogProcessor::builder(exporter, Tokio).build())
+            .with_resource(resource.clone())
+            .build();
+        layers.push(Box::new(OtelLogsLayer::new(provider.logger(env!("CARGO_PKG_NAME")))));
+        handles.logger_provider = Some(provider);
+    }
+
+    if config.has(Signal::Metrics) {
+        let exporter = match config.transport {
+            Transport::Grpc => MetricExporter::builder()
+                .with_tonic()
+                .with_protocol(Protocol::Grpc)
+                .with_endpoint(config.endpoint_for(Signal::Metrics)?)
+                .build(),
+            Transport::Http => MetricExporter::builder()
+                .with_http()
+                .with_protocol(Protocol::HttpBinary)
+                .with_endpoint(config.endpoint_for(Signal::Metrics)?)
+                .build(),
+        }
+        .context("failed to build OTLP metric exporter")?;
+        let reader = PeriodicReader::builder(exporter, Tokio)
+            .with_interval(config.metric_export_interval)
+            .build();
+        let provider = SdkMeterProvider::builder()
+            .with_reader(reader)
+            .with_resource(resource)
+            .build();
+        global::set_meter_provider(provider.clone());
+        let meter = global::meter(env!("CARGO_PKG_NAME"));
+        meter
+            .u64_observable_gauge("blokli_light_head_block")
+            .with_description("Latest Ethereum RPC head observed")
+            .with_callback(|observer| observer.observe(HEAD_BLOCK.load(Ordering::Relaxed), &[]))
+            .build();
+        meter
+            .u64_observable_gauge("blokli_light_indexed_block")
+            .with_description("Highest finalised built-in block committed")
+            .with_callback(|observer| observer.observe(INDEXED_BLOCK.load(Ordering::Relaxed), &[]))
+            .build();
+        handles.meter_provider = Some(provider);
+    }
+
+    OTLP_HANDLE
+        .get()
+        .ok_or_else(|| anyhow!("base tracing subscriber is not initialized"))?
+        .reload(identity_if_empty(layers))
+        .context("failed to install OTLP tracing layers")?;
+    tracing::info!(endpoint = %config.endpoint, signals = %format_signals(&config.signals), "OpenTelemetry export enabled");
+    Ok(handles)
+}
+
+/// Updates the gauges exported by the optional OTLP metrics provider.
+pub fn record_indexer_state(head_block: u64, indexed_block: u64) {
+    HEAD_BLOCK.store(head_block, Ordering::Relaxed);
+    INDEXED_BLOCK.store(indexed_block, Ordering::Relaxed);
+}
+
+fn identity_if_empty(layers: Vec<BoxedLayer>) -> Vec<BoxedLayer> {
+    if layers.is_empty() {
+        vec![Box::new(Identity::new())]
+    } else {
+        layers
+    }
+}
+
+fn parse_signals(raw: &str) -> Result<HashSet<Signal>> {
+    let signals = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| match value {
+            "traces" => Ok(Signal::Traces),
+            "logs" => Ok(Signal::Logs),
+            "metrics" => Ok(Signal::Metrics),
+            _ => bail!("unsupported OTLP signal '{value}'; use metrics,traces,logs"),
+        })
+        .collect::<Result<HashSet<_>>>()?;
+    if signals.is_empty() {
+        bail!("telemetry.otlp_signals must contain at least one signal");
+    }
+    Ok(signals)
+}
+
+fn format_signals(signals: &HashSet<Signal>) -> String {
+    [
+        (Signal::Metrics, "metrics"),
+        (Signal::Traces, "traces"),
+        (Signal::Logs, "logs"),
+    ]
+    .into_iter()
+    .filter_map(|(signal, name)| signals.contains(&signal).then_some(name))
+    .collect::<Vec<_>>()
+    .join(",")
+}
+
+fn infer_transport(endpoint: &str) -> Result<Transport> {
+    match endpoint.split_once("://").map(|(scheme, _)| scheme) {
+        Some("grpc") => Ok(Transport::Grpc),
+        Some("http" | "https") => Ok(Transport::Http),
+        Some(scheme) => bail!("unsupported telemetry endpoint scheme '{scheme}'"),
+        None => bail!("telemetry.otlp_endpoint must include a URL scheme"),
+    }
+}
+
+fn resolve_http_endpoint(endpoint: &str, signal: Signal) -> Result<String> {
+    let mut url = Url::parse(endpoint).context("invalid telemetry.otlp_endpoint")?;
+    let path = url.path();
+    let prefix = ["/v1/traces", "/v1/logs", "/v1/metrics"]
+        .into_iter()
+        .find_map(|suffix| path.strip_suffix(suffix))
+        .unwrap_or(path)
+        .trim_end_matches('/');
+    url.set_path(&format!("{prefix}{}", signal.path()));
+    Ok(url.to_string())
 }
 
 #[derive(Clone)]
@@ -123,474 +337,112 @@ impl OtelLogsLayer {
     }
 }
 
-impl<S> tracing_subscriber::Layer<S> for OtelLogsLayer
+impl<S> Layer<S> for OtelLogsLayer
 where
     S: tracing::Subscriber,
 {
-    fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+    fn on_event(&self, event: &Event<'_>, _context: LayerContext<'_, S>) {
         let metadata = event.metadata();
-        let mut visitor = TracingEventVisitor::default();
+        let mut visitor = EventVisitor::default();
         event.record(&mut visitor);
-
         let mut record = self.logger.create_log_record();
-        let event_timestamp = visitor.timestamp.unwrap_or(SystemTime::now());
-
-        let (severity_number, severity_text) = match *metadata.level() {
-            tracing::Level::ERROR => (Severity::Error, "ERROR"),
-            tracing::Level::WARN => (Severity::Warn, "WARN"),
-            tracing::Level::INFO => (Severity::Info, "INFO"),
-            tracing::Level::DEBUG => (Severity::Debug, "DEBUG"),
-            tracing::Level::TRACE => (Severity::Trace, "TRACE"),
+        let timestamp = SystemTime::now();
+        let (severity, text) = match *metadata.level() {
+            Level::ERROR => (Severity::Error, "ERROR"),
+            Level::WARN => (Severity::Warn, "WARN"),
+            Level::INFO => (Severity::Info, "INFO"),
+            Level::DEBUG => (Severity::Debug, "DEBUG"),
+            Level::TRACE => (Severity::Trace, "TRACE"),
         };
-
-        record.set_timestamp(event_timestamp);
-        record.set_observed_timestamp(event_timestamp);
-        record.set_target(metadata.target().to_string());
-        record.set_severity_number(severity_number);
-        record.set_severity_text(severity_text);
-
-        if let Some(message) = visitor.body.take() {
-            let body = HashMap::from([(Key::new("message"), AnyValue::String(message.into()))]);
-            record.set_body(AnyValue::Map(Box::new(body)));
+        record.set_timestamp(timestamp);
+        record.set_observed_timestamp(timestamp);
+        record.set_target(metadata.target().to_owned());
+        record.set_severity_number(severity);
+        record.set_severity_text(text);
+        if let Some(message) = visitor.message {
+            record.set_body(AnyValue::Map(Box::new(HashMap::from([(
+                Key::new("message"),
+                AnyValue::String(message.into()),
+            )]))));
         }
-        if let Some(module_path) = metadata.module_path() {
-            record.add_attribute("module_path", module_path.to_string());
-        }
-        if let Some(file) = metadata.file() {
-            record.add_attribute("file", file.to_string());
-        }
-        if let Some(line) = metadata.line() {
-            record.add_attribute("line", i64::from(line));
-        }
-        record.add_attribute("target", metadata.target().to_string());
-        if !visitor.attributes.is_empty() {
-            record.add_attributes(visitor.attributes);
-        }
-
+        record.add_attributes(visitor.attributes);
         self.logger.emit(record);
     }
 }
 
 #[derive(Default)]
-struct TracingEventVisitor {
-    body: Option<String>,
+struct EventVisitor {
+    message: Option<String>,
     attributes: Vec<(String, AnyValue)>,
-    timestamp: Option<std::time::SystemTime>,
 }
 
-impl TracingEventVisitor {
-    fn record_body_or_attribute<V>(&mut self, field: &Field, value: V)
+impl EventVisitor {
+    fn add<V>(&mut self, field: &Field, value: V)
     where
         V: Into<AnyValue> + ToString,
     {
         if field.name() == "message" {
-            self.body = Some(value.to_string());
+            self.message = Some(value.to_string());
         } else {
-            self.attributes.push((field.name().to_string(), value.into()));
-        }
-    }
-
-    fn maybe_record_unix_timestamp_millis(&mut self, field: &Field, value: u64) {
-        if field.name() == "timestamp" && self.timestamp.is_none() {
-            self.timestamp = UNIX_EPOCH.checked_add(Duration::from_millis(value));
+            self.attributes.push((field.name().to_owned(), value.into()));
         }
     }
 }
 
-impl Visit for TracingEventVisitor {
+impl Visit for EventVisitor {
     fn record_i64(&mut self, field: &Field, value: i64) {
-        if let Ok(value) = u64::try_from(value) {
-            self.maybe_record_unix_timestamp_millis(field, value);
-        }
-        self.record_body_or_attribute(field, value);
+        self.add(field, value);
     }
 
     fn record_u64(&mut self, field: &Field, value: u64) {
-        self.maybe_record_unix_timestamp_millis(field, value);
-        if value <= i64::MAX as u64 {
-            self.record_body_or_attribute(field, value as i64);
+        if let Ok(value) = i64::try_from(value) {
+            self.add(field, value);
         } else {
-            self.record_body_or_attribute(field, value.to_string());
+            self.add(field, value.to_string());
         }
     }
 
     fn record_bool(&mut self, field: &Field, value: bool) {
-        self.record_body_or_attribute(field, value);
+        self.add(field, value);
     }
 
     fn record_str(&mut self, field: &Field, value: &str) {
-        self.record_body_or_attribute(field, value.to_string());
+        self.add(field, value.to_owned());
     }
 
-    fn record_error(&mut self, field: &Field, value: &(dyn std::error::Error + 'static)) {
-        self.record_body_or_attribute(field, value.to_string());
+    fn record_error(&mut self, field: &Field, value: &(dyn StdError + 'static)) {
+        self.add(field, value.to_string());
     }
 
-    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        self.record_body_or_attribute(field, format!("{value:?}"));
-    }
-}
-
-pub fn init(verbosity: u8, config: &TelemetryConfig) -> Result<TelemetryHandles> {
-    let _ = verbosity;
-    let otlp_config = OtlpConfig::from_config(config)?;
-
-    let resource = Resource::builder()
-        .with_service_name(env!("CARGO_PKG_NAME").to_string())
-        .with_attributes([
-            KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
-            KeyValue::new("telemetry.sdk.language", "rust"),
-        ])
-        .build();
-
-    let mut handles = TelemetryHandles::default();
-    let mut otel_layers: Vec<OtelBoxedLayer> = Vec::new();
-
-    let trace_layer = if let Some(otlp_config) = otlp_config
-        .as_ref()
-        .filter(|config| config.has_signal(OtlpSignal::Traces))
-    {
-        let exporter = match otlp_config.transport {
-            OtlpTransport::Grpc => opentelemetry_otlp::SpanExporter::builder()
-                .with_tonic()
-                .with_protocol(Protocol::Grpc)
-                .with_endpoint(otlp_config.endpoint_for(OtlpSignal::Traces)?)
-                .with_timeout(Duration::from_secs(5))
-                .build(),
-            OtlpTransport::Http => opentelemetry_otlp::SpanExporter::builder()
-                .with_http()
-                .with_protocol(Protocol::HttpBinary)
-                .with_endpoint(otlp_config.endpoint_for(OtlpSignal::Traces)?)
-                .with_timeout(Duration::from_secs(5))
-                .build(),
-        }
-        .map_err(|error| BloklidError::NonSpecific(format!("failed to build OTLP trace exporter: {error}")))?;
-
-        let batch_processor = BatchSpanProcessor::builder(exporter, Tokio).build();
-        let tracer_provider = SdkTracerProvider::builder()
-            .with_span_processor(batch_processor)
-            .with_sampler(Sampler::AlwaysOn)
-            .with_id_generator(RandomIdGenerator::default())
-            .with_max_events_per_span(64)
-            .with_max_attributes_per_span(16)
-            .with_resource(resource.clone())
-            .build();
-        let tracer = tracer_provider.tracer(env!("CARGO_PKG_NAME"));
-        handles.tracer_provider = Some(tracer_provider);
-        Some(tracing_opentelemetry::layer().with_tracer(tracer).boxed())
-    } else {
-        None
-    };
-
-    let logs_layer = if let Some(otlp_config) = otlp_config
-        .as_ref()
-        .filter(|config| config.has_signal(OtlpSignal::Logs))
-    {
-        let exporter = match otlp_config.transport {
-            OtlpTransport::Grpc => opentelemetry_otlp::LogExporter::builder()
-                .with_tonic()
-                .with_protocol(Protocol::Grpc)
-                .with_endpoint(otlp_config.endpoint_for(OtlpSignal::Logs)?)
-                .with_timeout(Duration::from_secs(5))
-                .build(),
-            OtlpTransport::Http => opentelemetry_otlp::LogExporter::builder()
-                .with_http()
-                .with_protocol(opentelemetry_otlp::Protocol::HttpJson)
-                .with_endpoint(otlp_config.endpoint_for(OtlpSignal::Logs)?)
-                .with_timeout(Duration::from_secs(5))
-                .build(),
-        }
-        .map_err(|error| BloklidError::NonSpecific(format!("failed to build OTLP log exporter: {error}")))?;
-
-        let batch_processor = BatchLogProcessor::builder(exporter, Tokio).build();
-        let logger_provider = SdkLoggerProvider::builder()
-            .with_log_processor(batch_processor)
-            .with_resource(resource.clone())
-            .build();
-        let logger = logger_provider.logger(env!("CARGO_PKG_NAME"));
-        handles.logger_provider = Some(logger_provider);
-        Some(Box::new(OtelLogsLayer::new(logger)) as OtelBoxedLayer)
-    } else {
-        None
-    };
-
-    let prometheus_exporter = opentelemetry_prometheus_text_exporter::PrometheusExporter::builder()
-        .without_counter_suffixes()
-        .without_units()
-        .without_target_info()
-        .without_scope_info()
-        .build();
-
-    let meter_provider = if let Some(otlp_config) = otlp_config
-        .as_ref()
-        .filter(|config| config.has_signal(OtlpSignal::Metrics))
-    {
-        let exporter = match otlp_config.transport {
-            OtlpTransport::Grpc => opentelemetry_otlp::MetricExporter::builder()
-                .with_tonic()
-                .with_protocol(Protocol::Grpc)
-                .with_endpoint(otlp_config.endpoint_for(OtlpSignal::Metrics)?)
-                .with_timeout(Duration::from_secs(5))
-                .build(),
-            OtlpTransport::Http => opentelemetry_otlp::MetricExporter::builder()
-                .with_http()
-                .with_protocol(Protocol::HttpBinary)
-                .with_endpoint(otlp_config.endpoint_for(OtlpSignal::Metrics)?)
-                .with_timeout(Duration::from_secs(5))
-                .build(),
-        }
-        .map_err(|error| BloklidError::NonSpecific(format!("failed to build OTLP metric exporter: {error}")))?;
-
-        let reader = PeriodicReader::builder(exporter, Tokio)
-            .with_interval(otlp_config.metric_export_interval)
-            .build();
-
-        SdkMeterProvider::builder()
-            .with_reader(reader)
-            .with_reader(prometheus_exporter.clone())
-            .with_resource(resource.clone())
-            .build()
-    } else {
-        SdkMeterProvider::builder()
-            .with_reader(prometheus_exporter.clone())
-            .with_resource(resource.clone())
-            .build()
-    };
-
-    opentelemetry::global::set_meter_provider(meter_provider.clone());
-
-    if !hopr_telemetry::init_with_provider(prometheus_exporter, meter_provider.clone()) {
-        tracing::warn!("hopr-types telemetry global state was already initialized; custom provider not applied");
-    }
-
-    handles.meter_provider = Some(meter_provider);
-
-    if let Some(trace_layer) = trace_layer {
-        otel_layers.push(trace_layer);
-    }
-    if let Some(logs_layer) = logs_layer {
-        otel_layers.push(logs_layer);
-    }
-    telemetry_common::install_otel_layers(otel_layers)?;
-
-    if let Some(otlp_config) = otlp_config {
-        tracing::info!(
-            otlp_endpoint = otlp_config.endpoint,
-            otlp_protocol = %otlp_config.transport,
-            otlp_signals = %format_otlp_signals(otlp_config.signals),
-            metric_export_interval_ms = otlp_config.metric_export_interval.as_millis() as u64,
-            "OpenTelemetry export enabled"
-        );
-    }
-
-    Ok(handles)
-}
-
-fn default_otlp_signals() -> FlagSet<OtlpSignal> {
-    let mut signals = FlagSet::default();
-    signals |= OtlpSignal::Metrics;
-    signals
-}
-
-pub(crate) fn parse_otlp_signals(raw: &str) -> FlagSet<OtlpSignal> {
-    let mut signals = FlagSet::default();
-
-    for signal in raw.split(',') {
-        let signal = signal.trim();
-        if signal.is_empty() {
-            continue;
-        }
-
-        match OtlpSignal::from_str(signal) {
-            Ok(parsed) => signals |= parsed,
-            Err(_) => tracing::warn!(otlp_signal = signal, "invalid telemetry.otlp_signals value ignored"),
-        }
-    }
-
-    if signals.is_empty() {
-        let fallback = default_otlp_signals();
-        tracing::warn!(
-            otlp_signals = raw,
-            fallback_signals = %format_otlp_signals(fallback),
-            "telemetry.otlp_signals yielded no valid signals; falling back to defaults"
-        );
-        return fallback;
-    }
-
-    signals
-}
-
-fn format_otlp_signals(signals: FlagSet<OtlpSignal>) -> String {
-    [OtlpSignal::Traces, OtlpSignal::Logs, OtlpSignal::Metrics]
-        .into_iter()
-        .filter(|signal| signals.contains(*signal))
-        .map(|signal| signal.to_string())
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-fn infer_otlp_transport(endpoint: &str) -> Result<OtlpTransport> {
-    let (scheme, _) = endpoint
-        .split_once("://")
-        .ok_or_else(|| BloklidError::NonSpecific("telemetry.otlp_endpoint must include a URL scheme".into()))?;
-
-    OtlpTransport::from_str(scheme).map_err(|_| {
-        BloklidError::NonSpecific(format!(
-            "unsupported telemetry.otlp_endpoint scheme '{scheme}'; use grpc://, http://, or https://"
-        ))
-    })
-}
-
-fn normalize_otlp_endpoint(endpoint: &str, transport: OtlpTransport) -> String {
-    if transport == OtlpTransport::Grpc {
-        endpoint.replacen("grpc://", "http://", 1)
-    } else {
-        endpoint.to_string()
-    }
-}
-
-fn resolve_otlp_endpoint(endpoint: &str, transport: OtlpTransport, signal: OtlpSignal) -> Result<String> {
-    match transport {
-        OtlpTransport::Grpc => Ok(normalize_otlp_endpoint(endpoint, transport)),
-        OtlpTransport::Http => resolve_http_otlp_endpoint(endpoint, signal),
-    }
-}
-
-fn resolve_http_otlp_endpoint(endpoint: &str, signal: OtlpSignal) -> Result<String> {
-    let mut url = Url::parse(endpoint).map_err(|error| {
-        BloklidError::NonSpecific(format!(
-            "failed to parse telemetry.otlp_endpoint '{endpoint}' as an HTTP(S) URL: {error}"
-        ))
-    })?;
-    let signal_path = otlp_http_signal_path(signal);
-    let current_path = url.path();
-
-    if current_path.is_empty() || current_path == "/" {
-        url.set_path(signal_path);
-        return Ok(url.to_string());
-    }
-
-    if let Some(prefix) = strip_known_http_signal_suffix(current_path) {
-        let normalized_path = format!("{prefix}{signal_path}");
-        url.set_path(&normalized_path);
-        return Ok(url.to_string());
-    }
-
-    let normalized_path = format!("{}{signal_path}", current_path.trim_end_matches('/'));
-    url.set_path(&normalized_path);
-    Ok(url.to_string())
-}
-
-fn strip_known_http_signal_suffix(path: &str) -> Option<&str> {
-    ["/v1/traces", "/v1/logs", "/v1/metrics"]
-        .into_iter()
-        .find_map(|suffix| path.strip_suffix(suffix))
-}
-
-fn otlp_http_signal_path(signal: OtlpSignal) -> &'static str {
-    match signal {
-        OtlpSignal::Traces => "/v1/traces",
-        OtlpSignal::Logs => "/v1/logs",
-        OtlpSignal::Metrics => "/v1/metrics",
+    fn record_debug(&mut self, field: &Field, value: &dyn Debug) {
+        self.add(field, format!("{value:?}"));
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{Signal, Transport, infer_transport, parse_signals, resolve_http_endpoint};
 
     #[test]
-    fn test_infer_otlp_transport_from_http_endpoint() {
+    fn parses_transport_and_signal_paths() {
         assert_eq!(
-            infer_otlp_transport("http://localhost:4318/v1/metrics").expect("http endpoint should parse"),
-            OtlpTransport::Http
+            infer_transport("grpc://localhost:4317").expect("valid endpoint"),
+            Transport::Grpc
         );
         assert_eq!(
-            infer_otlp_transport("https://collector.example/v1/metrics").expect("https endpoint should parse"),
-            OtlpTransport::Http
+            infer_transport("https://collector.example").expect("valid endpoint"),
+            Transport::Http
         );
-    }
-
-    #[test]
-    fn test_infer_otlp_transport_from_grpc_endpoint() {
         assert_eq!(
-            infer_otlp_transport("grpc://localhost:4317").expect("grpc endpoint should parse"),
-            OtlpTransport::Grpc
+            resolve_http_endpoint("http://localhost:4318/v1/metrics", Signal::Logs).expect("valid endpoint"),
+            "http://localhost:4318/v1/logs"
         );
     }
 
     #[test]
-    fn test_infer_otlp_transport_rejects_invalid_scheme() {
-        let error = infer_otlp_transport("ftp://localhost:4317").expect_err("unsupported scheme should fail");
-        assert!(
-            error.to_string().contains("unsupported telemetry.otlp_endpoint scheme"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn test_parse_otlp_signals_accepts_multiple_values() {
-        let signals = parse_otlp_signals("metrics,traces,logs");
-        assert!(signals.contains(OtlpSignal::Metrics));
-        assert!(signals.contains(OtlpSignal::Traces));
-        assert!(signals.contains(OtlpSignal::Logs));
-    }
-
-    #[test]
-    fn test_parse_otlp_signals_ignores_invalid_value() {
-        let signals = parse_otlp_signals("metrics,invalid");
-        assert!(signals.contains(OtlpSignal::Metrics));
-        assert!(!signals.contains(OtlpSignal::Traces));
-        assert!(!signals.contains(OtlpSignal::Logs));
-    }
-
-    #[test]
-    fn test_parse_otlp_signals_falls_back_for_empty_input() {
-        let signals = parse_otlp_signals("");
-        assert_eq!(signals, default_otlp_signals());
-    }
-
-    #[test]
-    fn test_normalize_otlp_endpoint_for_grpc() {
-        assert_eq!(
-            normalize_otlp_endpoint("grpc://localhost:4317", OtlpTransport::Grpc),
-            "http://localhost:4317"
-        );
-    }
-
-    #[test]
-    fn test_resolve_http_otlp_endpoint_appends_metric_path_for_base_url() {
-        assert_eq!(
-            resolve_http_otlp_endpoint("http://localhost:4318", OtlpSignal::Metrics)
-                .expect("base collector URL should resolve"),
-            "http://localhost:4318/v1/metrics"
-        );
-    }
-
-    #[test]
-    fn test_resolve_http_otlp_endpoint_appends_signal_path_for_nested_base_url() {
-        assert_eq!(
-            resolve_http_otlp_endpoint("https://collector.example/otel", OtlpSignal::Logs)
-                .expect("nested base collector URL should resolve"),
-            "https://collector.example/otel/v1/logs"
-        );
-    }
-
-    #[test]
-    fn test_resolve_http_otlp_endpoint_rewrites_existing_signal_suffix() {
-        assert_eq!(
-            resolve_http_otlp_endpoint("http://localhost:4318/v1/metrics", OtlpSignal::Traces)
-                .expect("legacy full metrics path should be rewritten for traces"),
-            "http://localhost:4318/v1/traces"
-        );
-    }
-
-    #[test]
-    fn test_resolve_otlp_endpoint_keeps_grpc_normalization() {
-        assert_eq!(
-            resolve_otlp_endpoint("grpc://localhost:4317", OtlpTransport::Grpc, OtlpSignal::Metrics)
-                .expect("grpc endpoint should normalize"),
-            "http://localhost:4317"
-        );
+    fn rejects_unknown_or_empty_signals() {
+        assert!(parse_signals("metrics,traces").is_ok());
+        assert!(parse_signals("unknown").is_err());
+        assert!(parse_signals("").is_err());
     }
 }

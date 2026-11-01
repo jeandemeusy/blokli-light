@@ -1,487 +1,808 @@
-mod args;
-mod config;
-mod constants;
-mod errors;
-mod network;
-mod telemetry;
-mod telemetry_common;
+use std::{fs::OpenOptions, io::Write, path::PathBuf, process::ExitCode, time::Duration};
 
-use std::{
-    process::ExitCode,
-    sync::{Arc, RwLock},
-    time::Duration,
+use anyhow::{Error as AnyhowError, Result, anyhow, bail};
+use blokli_light::{
+    builtin::{BuiltinTopics, chain_id as binding_chain_id, service_registry_source, sources as builtin_sources},
+    config::{Config, SourceConfig, TopicsMode},
+    database::{Database, NewSource, SourceKind},
+    indexer::{IndexerConfig, run},
+    rpc::RpcClient,
+    source::{format_address, normalize_events, parse_address},
+    telemetry,
 };
+use clap::{Parser, Subcommand, ValueEnum};
+use url::Url;
 
-use args::{Args, Command, generate_config_template, peek_verbosity_from_env_args};
-use async_signal::{Signal, Signals};
-use blokli_api::server::ApiDatabases;
-use blokli_chain_api::{
-    BlokliChain, hopr_policy::HoprPolicyConfig, transaction_executor::RawTransactionExecutorConfig,
-    transaction_monitor::TransactionMonitorConfig,
-};
-use blokli_chain_indexer::{snapshot::SnapshotManager, startup, utils::redact_url};
-use blokli_db::{
-    db::{BlokliDb, BlokliDbConfig},
-    utils::redact_database_url,
-};
-use clap::Parser;
-use futures::TryStreamExt;
-use tokio::net::TcpListener;
+/// Raw-log indexer for HOPR and operator-defined Ethereum contracts.
+#[derive(Debug, Parser)]
+#[command(name = "blokli-light", version, about)]
+struct Args {
+    /// TOML configuration file.
+    #[arg(short = 'c', long, env = "BLOKLI_LIGHT_CONFIG_PATH")]
+    config: Option<PathBuf>,
 
-use crate::{
-    config::{Config, DatabaseConfig},
-    errors::BloklidError,
-};
+    /// PostgreSQL connection string used for migrations and storage.
+    #[arg(long, env = "BLOKLI_LIGHT_DATABASE_URL")]
+    database_url: Option<String>,
+
+    /// Maximum PostgreSQL writer-pool connections.
+    #[arg(long, env = "BLOKLI_LIGHT_DATABASE_MAX_CONNECTIONS")]
+    database_max_connections: Option<u32>,
+
+    /// Ethereum JSON-RPC URL, required by `source add` to validate contract code.
+    #[arg(long, env = "BLOKLI_LIGHT_RPC_URL")]
+    rpc_url: Option<String>,
+
+    /// Maximum JSON-RPC requests per second. Zero disables throttling.
+    #[arg(long, env = "BLOKLI_LIGHT_MAX_RPC_REQUESTS_PER_SEC")]
+    max_rpc_requests_per_sec: Option<u32>,
+
+    /// Number of confirmations excluded from the durable watermark.
+    #[arg(long, env = "BLOKLI_LIGHT_CONFIRMATIONS")]
+    confirmations: Option<u64>,
+
+    /// Initial maximum number of blocks fetched by an eth_getLogs request.
+    #[arg(long, env = "BLOKLI_LIGHT_MAX_BLOCK_RANGE")]
+    max_block_range: Option<u64>,
+
+    /// Seconds between finality-head polls.
+    #[arg(long, env = "BLOKLI_LIGHT_POLL_INTERVAL_SECONDS")]
+    poll_interval_seconds: Option<u64>,
+
+    /// Maximum seconds before changed source rows are observed.
+    #[arg(long, env = "BLOKLI_LIGHT_SOURCE_POLL_INTERVAL_SECONDS")]
+    source_poll_interval_seconds: Option<u64>,
+
+    #[arg(long, env = "BLOKLI_LIGHT_NETWORK")]
+    network: Option<String>,
+
+    #[arg(long, env = "BLOKLI_LIGHT_INDEXER_TOPICS", value_enum)]
+    topics: Option<TopicMode>,
+
+    /// Override the bindings start block when non-zero.
+    #[arg(long, env = "BLOKLI_LIGHT_INDEXER_START_BLOCK")]
+    indexer_start_block: Option<u64>,
+
+    /// Maximum concurrent lower-priority custom backfills.
+    #[arg(long, env = "BLOKLI_LIGHT_BACKFILL_CONCURRENCY")]
+    backfill_concurrency: Option<usize>,
+
+    #[arg(long, env = "BLOKLI_LIGHT_CONTRACT_CHANNELS")]
+    contract_channels: Option<String>,
+    #[arg(long, env = "BLOKLI_LIGHT_CONTRACT_ANNOUNCEMENTS")]
+    contract_announcements: Option<String>,
+    #[arg(long, env = "BLOKLI_LIGHT_CONTRACT_NODE_SAFE_REGISTRY")]
+    contract_node_safe_registry: Option<String>,
+    #[arg(long, env = "BLOKLI_LIGHT_CONTRACT_NODE_STAKE_FACTORY")]
+    contract_node_stake_factory: Option<String>,
+    #[arg(long, env = "BLOKLI_LIGHT_CONTRACT_TICKET_PRICE_ORACLE")]
+    contract_ticket_price_oracle: Option<String>,
+    #[arg(long, env = "BLOKLI_LIGHT_CONTRACT_WINNING_PROBABILITY_ORACLE")]
+    contract_winning_probability_oracle: Option<String>,
+    #[arg(long, env = "BLOKLI_LIGHT_CONTRACT_SERVICE_REGISTRY")]
+    contract_service_registry: Option<String>,
+
+    /// Read-only PostgreSQL role name.
+    #[arg(long, env = "BLOKLI_LIGHT_READER_USER")]
+    reader_user: Option<String>,
+
+    /// Read-only PostgreSQL role password.
+    #[arg(long, env = "BLOKLI_LIGHT_READER_PASSWORD", hide_env_values = true)]
+    reader_password: Option<String>,
+
+    /// OTLP collector endpoint. Supports grpc://, http://, and https://.
+    #[arg(long, env = "BLOKLI_LIGHT_OTLP_ENDPOINT")]
+    otlp_endpoint: Option<String>,
+
+    /// Comma-separated OTLP signals: metrics,traces,logs.
+    #[arg(long, env = "BLOKLI_LIGHT_OTLP_SIGNALS")]
+    otlp_signals: Option<String>,
+
+    /// Interval in seconds between OTLP metric exports.
+    #[arg(long, env = "BLOKLI_LIGHT_METRIC_EXPORT_INTERVAL_SECONDS")]
+    metric_export_interval_seconds: Option<u64>,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Write a documented example configuration without overwriting an existing file.
+    GenerateConfig {
+        #[arg(default_value = "blokli-light.toml")]
+        output: PathBuf,
+    },
+    /// Apply PostgreSQL migrations and exit.
+    Migrate,
+    /// Manage contracts whose raw logs are indexed.
+    Source {
+        #[command(subcommand)]
+        command: SourceCommand,
+    },
+    /// Show chain lag, raw row count, and per-source completeness.
+    Status,
+    /// Manage database access.
+    Db {
+        #[command(subcommand)]
+        command: DbCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DbCommand {
+    /// Create or update the restricted direct-SQL reader role.
+    Reader {
+        /// One-off privileged URL when the writer cannot create roles.
+        #[arg(long, env = "BLOKLI_LIGHT_DATABASE_ADMIN_URL")]
+        admin_url: Option<String>,
+        /// Print the Arrakis DATA_SOURCES setting after provisioning.
+        #[arg(long)]
+        print_url: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum TopicMode {
+    Known,
+    All,
+}
+
+#[derive(Debug, Subcommand)]
+enum SourceCommand {
+    /// Add a custom contract source after validating that code exists at its address.
+    Add {
+        /// Stable name used by status and management commands.
+        #[arg(long)]
+        name: String,
+        /// Contract address.
+        #[arg(long)]
+        address: String,
+        /// First block to fetch. This value is required because no safe default exists.
+        #[arg(long)]
+        from_block: u64,
+        /// Text signatures or 0x-prefixed topic0 hashes. Omit to index every event.
+        #[arg(long)]
+        events: Vec<String>,
+    },
+    /// Add event signatures to a source and re-backfill it idempotently.
+    Widen {
+        /// Existing custom source name.
+        #[arg(long)]
+        name: String,
+        /// Text signatures or 0x-prefixed topic0 hashes to add.
+        #[arg(long, required = true)]
+        events: Vec<String>,
+    },
+    /// Stop following a source without deleting its stored logs.
+    Disable {
+        /// Existing custom source name.
+        #[arg(long)]
+        name: String,
+    },
+    /// List built-in and custom source state.
+    List,
+}
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    const BIN_NAME: &str = env!("CARGO_PKG_NAME");
-    let verbosity = peek_verbosity_from_env_args();
-
-    if telemetry_common::install_base_subscriber(verbosity).is_err() {
+    if let Err(error) = telemetry::install_base_subscriber() {
+        eprintln!("failed to initialise tracing: {error}");
         return ExitCode::FAILURE;
     }
-
-    let args = match Args::try_parse() {
-        Ok(args) => args,
-        Err(error) => {
-            if matches!(
-                error.kind(),
-                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
-            ) {
-                tracing::info!(%error, "displaying command output");
-                return ExitCode::SUCCESS;
+    let args = Args::parse();
+    if let Some(Command::GenerateConfig { output }) = &args.command {
+        return match write_example_config(output) {
+            Ok(()) => {
+                println!("wrote {}", output.display());
+                ExitCode::SUCCESS
             }
-            let raw_args: Vec<String> = std::env::args().skip(1).collect();
-            tracing::error!(bin_name = BIN_NAME, args = ?raw_args, %error, "error parsing arguments");
+            Err(error) => {
+                eprintln!("failed to write configuration: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    let file_config = match args.config.as_deref().map(Config::from_file).transpose() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("failed to load configuration: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut telemetry_config = file_config
+        .as_ref()
+        .map(|config| config.telemetry.clone())
+        .unwrap_or_default();
+    telemetry_config.otlp_endpoint = args.otlp_endpoint.clone().or(telemetry_config.otlp_endpoint);
+    telemetry_config.otlp_signals = args.otlp_signals.clone().unwrap_or(telemetry_config.otlp_signals);
+    if let Some(seconds) = args.metric_export_interval_seconds {
+        telemetry_config.metric_export_interval = Duration::from_secs(seconds);
+    }
+    let _telemetry_handles = match telemetry::configure(&telemetry_config) {
+        Ok(handles) => handles,
+        Err(error) => {
+            tracing::error!(%error, "failed to configure telemetry");
             return ExitCode::FAILURE;
         }
     };
 
-    if !matches!(
-        args.command,
-        Some(Command::GenerateConfig { .. } | Command::ExportLogsSnapshot { .. })
-    ) {
-        let config = match args.load_config(true) {
-            Ok(config) => config,
-            Err(error) => {
-                tracing::error!(bin_name = BIN_NAME, %error, "error loading config");
-                return ExitCode::FAILURE;
-            }
-        };
+    let database_url = args
+        .database_url
+        .as_deref()
+        .or_else(|| file_config.as_ref().map(|config| config.database.url.as_str()));
+    let Some(database_url) = database_url else {
+        tracing::error!("BLOKLI_LIGHT_DATABASE_URL or --database-url is required");
+        return ExitCode::FAILURE;
+    };
+    let mut contract_overrides = file_config
+        .as_ref()
+        .map(|config| config.contracts.clone())
+        .unwrap_or_default();
+    contract_overrides.channels = args.contract_channels.clone().or(contract_overrides.channels);
+    contract_overrides.announcements = args.contract_announcements.clone().or(contract_overrides.announcements);
+    contract_overrides.node_safe_registry = args
+        .contract_node_safe_registry
+        .clone()
+        .or(contract_overrides.node_safe_registry);
+    contract_overrides.node_stake_factory = args
+        .contract_node_stake_factory
+        .clone()
+        .or(contract_overrides.node_stake_factory);
+    contract_overrides.ticket_price_oracle = args
+        .contract_ticket_price_oracle
+        .clone()
+        .or(contract_overrides.ticket_price_oracle);
+    contract_overrides.winning_probability_oracle = args
+        .contract_winning_probability_oracle
+        .clone()
+        .or(contract_overrides.winning_probability_oracle);
+    contract_overrides.service_registry = args
+        .contract_service_registry
+        .clone()
+        .or(contract_overrides.service_registry);
 
-        let telemetry_handles = match telemetry::init(args.verbose, &config.telemetry) {
-            Ok(handles) => handles,
-            Err(error) => {
-                tracing::error!(bin_name = BIN_NAME, %error, "error initializing telemetry");
-                return ExitCode::FAILURE;
-            }
-        };
-
-        let run_result = run(args, Some(config)).await;
-        drop(telemetry_handles);
-
-        if let Err(error) = run_result {
-            tracing::error!(bin_name = BIN_NAME, %error, "error while running process");
+    let max_connections = args
+        .database_max_connections
+        .or_else(|| file_config.as_ref().map(|config| config.database.max_connections));
+    let database = match Database::connect_with_max_connections(database_url, max_connections.unwrap_or(5)).await {
+        Ok(database) => database,
+        Err(error) => {
+            tracing::error!(%error, "failed to connect to PostgreSQL");
             return ExitCode::FAILURE;
         }
-    } else if let Err(error) = run(args, None).await {
-        tracing::error!(bin_name = BIN_NAME, %error, "error while running process");
+    };
+
+    if let Err(error) = database.migrate().await {
+        tracing::error!(%error, "failed to apply database migrations");
         return ExitCode::FAILURE;
     }
-    ExitCode::SUCCESS
-}
 
-async fn run(args: Args, initial_config: Option<Config>) -> errors::Result<()> {
-    // Handle subcommands
-    match &args.command {
-        Some(Command::GenerateConfig { output }) => {
-            tracing::info!(path = %output.display(), "generating configuration template");
-
-            // Generate the template content
-            let template = generate_config_template();
-
-            // Create parent directories if they don't exist
-            if let Some(parent) = output.parent() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .map_err(|e| BloklidError::NonSpecific(format!("Failed to create parent directories: {}", e)))?;
-            }
-
-            // Write the template to the specified file
-            tokio::fs::write(output, template)
-                .await
-                .map_err(|e| BloklidError::NonSpecific(format!("Failed to write configuration template: {}", e)))?;
-
-            tracing::info!("Configuration template successfully written to: {}", output.display());
-            return Ok(());
+    match args.command {
+        Some(Command::GenerateConfig { .. }) => ExitCode::SUCCESS,
+        Some(Command::Migrate) => ExitCode::SUCCESS,
+        Some(Command::Source { command }) => {
+            let rpc_url = args
+                .rpc_url
+                .as_deref()
+                .or_else(|| file_config.as_ref().map(|config| config.rpc_url.as_str()));
+            run_source_command(&database, rpc_url, command).await
         }
-        Some(Command::ExportLogsSnapshot { output }) => {
-            let config = match initial_config {
-                Some(config) => config,
-                None => args.load_config(true)?,
-            };
-
-            let database = require_database(&config)?;
-
-            let db_config = BlokliDbConfig {
-                max_connections: database.max_connections(),
-                log_slow_queries: Duration::from_secs(1),
-                network_name: config.network.to_string(),
-            };
-
-            let db = if database.is_in_memory() {
-                BlokliDb::new_in_memory().await?
-            } else {
-                BlokliDb::new(&database.to_url(), database.to_logs_url().as_deref(), db_config).await?
-            };
-
-            let snapshot_manager = SnapshotManager::with_db(db)?;
-            let info = snapshot_manager.export_snapshot(output).await?;
-
-            tracing::info!(
-                path = %output.display(),
-                logs = info.log_count.unwrap_or(0),
-                latest_block = info.latest_block.unwrap_or(0),
-                "Logs snapshot exported successfully"
-            );
-
-            return Ok(());
+        Some(Command::Status) => run_status_command(&database).await,
+        Some(Command::Db { command }) => {
+            let reader_user = args
+                .reader_user
+                .as_deref()
+                .or_else(|| file_config.as_ref().map(|config| config.database.reader.user.as_str()))
+                .unwrap_or("blokli_reader");
+            run_db_command(
+                &database,
+                database_url,
+                reader_user,
+                args.reader_password.as_deref(),
+                command,
+            )
+            .await
         }
         None => {
-            // No subcommand, continue with normal daemon operation
-        }
-    }
-
-    // Normal daemon operation
-    tracing::info!(
-        verbosity = args.verbose,
-        config = args.config.as_ref().map(|p| p.display().to_string()).as_deref(),
-        "bloklid starting"
-    );
-
-    // Initial config load
-    let config = Arc::new(RwLock::new(match initial_config {
-        Some(config) => config,
-        None => args.load_config(true)?,
-    }));
-
-    // Log the final configuration with redacted secrets
-    {
-        let cfg = config
-            .read()
-            .map_err(|_| BloklidError::NonSpecific("failed to lock config for logging".into()))?;
-        tracing::info!(config = %cfg.display_redacted(), "loaded redacted configuration");
-    }
-
-    // Initialize components
-    let (process_handles, api_handle) = {
-        let (database_path, logs_database_path, chain_network, contracts, indexer_config, rpc_url, api_config) = {
-            let cfg = config
-                .read()
-                .map_err(|_| BloklidError::NonSpecific("failed to lock config".into()))?;
-
-            let chain_network = cfg
-                .chain_network
+            let rpc_url = args
+                .rpc_url
+                .as_deref()
+                .or_else(|| file_config.as_ref().map(|config| config.rpc_url.as_str()));
+            let network = args
+                .network
+                .as_deref()
+                .or_else(|| file_config.as_ref().map(|config| config.network.as_str()))
+                .unwrap_or("jura-dev");
+            let max_block_range = args
+                .max_block_range
+                .or_else(|| file_config.as_ref().map(|config| config.max_block_range))
+                .unwrap_or(10_000);
+            let topics =
+                args.topics
+                    .unwrap_or_else(|| match file_config.as_ref().map(|config| config.indexer.topics) {
+                        Some(TopicsMode::All) => TopicMode::All,
+                        _ => TopicMode::Known,
+                    });
+            let declarative_sources = file_config
                 .as_ref()
-                .ok_or_else(|| BloklidError::NonSpecific("Chain network not configured".into()))?
-                .clone();
-
-            let database = require_database(&cfg)?;
-
-            let indexer_config = blokli_chain_indexer::IndexerConfig {
-                start_block_number: chain_network.channel_contract_deploy_block as u64,
-                fast_sync: cfg.indexer.fast_sync,
-                enable_logs_snapshot: cfg.indexer.enable_logs_snapshot,
-                enable_safe_indexing: cfg.indexer.enable_safe_indexing,
-                enable_curvy_indexing: cfg.indexer.enable_curvy_indexing,
-                logs_snapshot_url: cfg.indexer.logs_snapshot_url.clone(),
-                data_directory: cfg.data_directory.clone(),
-                event_bus_capacity: cfg.indexer.subscription.event_bus_capacity,
-                shutdown_signal_capacity: cfg.indexer.subscription.shutdown_signal_capacity,
-            };
-
-            (
-                database.to_url(),
-                database.to_logs_url(),
-                chain_network,
-                cfg.contracts,
-                indexer_config,
-                cfg.rpc_url.clone(),
-                cfg.api.clone(),
-            )
-        };
-
-        if let Some(logs_path) = &logs_database_path {
-            tracing::info!("Initializing dual-database setup:");
-            tracing::info!("  Index database: {}", redact_database_url(&database_path));
-            tracing::info!("  Logs database: {}", redact_database_url(logs_path));
-        } else {
-            tracing::info!("Initializing single database: {}", redact_database_url(&database_path));
-        }
-
-        // Initialize database
-        let db_config = {
-            let cfg = config
-                .read()
-                .map_err(|_| BloklidError::NonSpecific("failed to lock config".into()))?;
-
-            BlokliDbConfig {
-                max_connections: {
-                    cfg.database
-                        .as_ref()
-                        .ok_or_else(|| {
-                            BloklidError::DatabaseNotConfigured(
-                                "Failed to read database configuration during connection pool initialization"
-                                    .to_string(),
-                            )
-                        })?
-                        .max_connections()
-                },
-                log_slow_queries: Duration::from_secs(1),
-                network_name: cfg.network.to_string(),
+                .map(|config| config.sources.as_slice())
+                .unwrap_or_default();
+            let start_block = args
+                .indexer_start_block
+                .or_else(|| file_config.as_ref().map(|config| config.indexer.start_block))
+                .unwrap_or_default();
+            let reader_user = args
+                .reader_user
+                .as_deref()
+                .or_else(|| file_config.as_ref().map(|config| config.database.reader.user.as_str()))
+                .unwrap_or("blokli_reader");
+            if let Some(password) = args.reader_password.as_deref()
+                && let Err(error) = database.provision_reader(reader_user, password).await
+            {
+                tracing::error!(%error, "failed to provision database reader role");
+                return ExitCode::FAILURE;
             }
-        };
-
-        let is_in_memory = {
-            let cfg = config
-                .read()
-                .map_err(|_| BloklidError::NonSpecific("failed to lock config".into()))?;
-            cfg.database
-                .as_ref()
-                .ok_or_else(|| {
-                    BloklidError::DatabaseNotConfigured(
-                        "Failed to read database configuration during connection pool initialization".to_string(),
-                    )
-                })?
-                .is_in_memory()
-        };
-
-        let db = if is_in_memory {
-            BlokliDb::new_in_memory().await?
-        } else {
-            BlokliDb::new(&database_path, logs_database_path.as_deref(), db_config.clone()).await?
-        };
-
-        // Initialize singleton entries for chain_info and node_info
-        db.ensure_singletons()
-            .await
-            .map_err(|e| BloklidError::NonSpecific(format!("Failed to initialize database singletons: {e}")))?;
-
-        tracing::info!("Connecting to RPC endpoint: {}", redact_url(&rpc_url));
-
-        // Extract chain_id and network name for configuration
-        let chain_id = chain_network.chain_id;
-        let network = {
-            let cfg = config
-                .read()
-                .map_err(|_| BloklidError::NonSpecific("failed to lock config".into()))?;
-            cfg.network.to_string()
-        };
-
-        // Create BlokliChain instance
-        let enable_safe_indexing = indexer_config.enable_safe_indexing;
-        let transaction_executor_config = RawTransactionExecutorConfig {
-            max_submitted_transactions: api_config.transactions.max_submitted_transactions,
-            max_submitted_transactions_per_identity: api_config.transactions.max_submitted_transactions_per_identity,
-            enable_revert_reason_tracing: api_config.transactions.enable_revert_reason_tracing,
-            hopr_policy: HoprPolicyConfig {
-                enabled: api_config.transactions.enable_hopr_action_validation,
-                action_ttl: api_config.transactions.hopr_action_ttl,
-                invalid_action_threshold: api_config.transactions.hopr_invalid_action_threshold,
-                invalid_action_cooldown: api_config.transactions.hopr_invalid_action_cooldown,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let transaction_monitor_config = TransactionMonitorConfig {
-            max_queued_trace_jobs: api_config.transactions.max_queued_trace_jobs,
-            max_concurrent_trace_jobs: api_config.transactions.max_concurrent_trace_jobs,
-            enable_revert_reason_tracing: api_config.transactions.enable_revert_reason_tracing,
-            ..Default::default()
-        };
-        let blokli_chain = BlokliChain::new(
-            db,
-            chain_network,
-            contracts,
-            indexer_config,
-            rpc_url,
-            transaction_executor_config,
-            transaction_monitor_config,
-        )
-        .await?;
-        let contracts = blokli_chain.contract_addresses();
-
-        // Verify RPC supports required capabilities (debug tracing)
-        if api_config.transactions.enable_revert_reason_tracing {
-            blokli_chain.verify_rpc_capabilities().await?;
-        } else {
-            tracing::info!(
-                "Skipping debug tracing capability verification because Safe revert-reason tracing is disabled"
-            );
-        }
-
-        if enable_safe_indexing {
-            startup::refresh_preseeded_safe_modules(blokli_chain.db(), blokli_chain.rpc()).await?;
-        }
-
-        // Get IndexerState for API subscriptions
-        let indexer_state = blokli_chain.indexer_state();
-
-        // Start API server if enabled (before starting indexer processes)
-        // This ensures the API is available immediately even if indexer initialization takes time
-        let api_handle = if api_config.enabled {
-            tracing::info!("Starting blokli-api server on {}", api_config.bind_address);
-
-            // Construct blokli-api ApiConfig from bloklid config
-            // We need to get rpc_url and contracts from the original config
-            let (rpc_url_for_api, _contracts_for_api, expected_block_time, finality) = {
-                let cfg = config
-                    .read()
-                    .map_err(|_| BloklidError::NonSpecific("failed to lock config".into()))?;
-                (
-                    cfg.rpc_url.clone(),
-                    cfg.contracts,
-                    cfg.network.expected_block_time(),
-                    cfg.network.confirmations(),
-                )
-            };
-
-            let blokli_api_config = blokli_api::config::ApiConfig {
-                bind_address: api_config.bind_address,
-                playground_enabled: api_config.playground_enabled,
-                database_url: database_path.clone(),
-                tls: None,
-                cors_allowed_origins: vec!["*".to_string()], // Permissive for now
-                chain_id,
-                rpc_url: rpc_url_for_api,
-                contract_addresses: contracts,
-                expected_block_time,
-                gas_multiplier: api_config.gas_multiplier,
-                min_priority_fee_per_gas: api_config.min_priority_fee_per_gas,
-                min_max_fee_per_gas: api_config.min_max_fee_per_gas,
-                sse_keepalive: blokli_api::config::SseKeepAliveConfig {
-                    enabled: api_config.sse_keepalive.enabled,
-                    interval: api_config.sse_keepalive.interval,
-                    text: api_config.sse_keepalive.text.clone(),
+            run_indexer(
+                &database,
+                RuntimeConfig {
+                    rpc_url,
+                    confirmations: args
+                        .confirmations
+                        .or_else(|| file_config.as_ref().map(|config| config.indexer.confirmations))
+                        .unwrap_or(3),
+                    max_block_range,
+                    poll_interval: args
+                        .poll_interval_seconds
+                        .map(Duration::from_secs)
+                        .or_else(|| file_config.as_ref().map(|config| config.indexer.poll_interval))
+                        .unwrap_or(Duration::from_secs(5)),
+                    source_poll_interval: args
+                        .source_poll_interval_seconds
+                        .map(Duration::from_secs)
+                        .or_else(|| file_config.as_ref().map(|config| config.indexer.source_poll_interval))
+                        .unwrap_or(Duration::from_secs(30)),
+                    max_rpc_requests_per_sec: args
+                        .max_rpc_requests_per_sec
+                        .or_else(|| file_config.as_ref().map(|config| config.max_rpc_requests_per_sec))
+                        .unwrap_or_default(),
+                    backfill_concurrency: args
+                        .backfill_concurrency
+                        .or_else(|| file_config.as_ref().map(|config| config.indexer.backfill_concurrency))
+                        .unwrap_or(2),
+                    network,
+                    topics,
+                    start_block,
+                    declarative_sources,
+                    reconcile_config_sources: file_config.is_some(),
+                    contracts: &contract_overrides,
                 },
-                health: blokli_api::config::HealthConfig {
-                    max_indexer_lag: api_config.health.max_indexer_lag,
-                    timeout: api_config.health.timeout,
-                    readiness_check_interval: api_config.health.readiness_check_interval,
-                },
-                max_query_depth: api_config.max_query_depth,
-                max_query_complexity: api_config.max_query_complexity,
-            };
-
-            // Get RPC operations from blokli_chain for balance queries
-            let rpc_operations = Arc::new(blokli_chain.rpc().clone());
-
-            // Build API app with indexer state for subscriptions and transaction components
-            let api_app = blokli_api::server::build_app(
-                ApiDatabases::from_blokli(blokli_chain.db()),
-                network.clone(),
-                blokli_api_config,
-                expected_block_time,
-                finality,
-                indexer_state,
-                blokli_chain.transaction_executor(),
-                blokli_chain.transaction_store(),
-                rpc_operations,
             )
             .await
-            .map_err(|e| BloklidError::NonSpecific(format!("Failed to build API app: {}", e)))?;
-
-            // Bind the listener first to ensure the port is available before spawning the server
-            let listener = TcpListener::bind(api_config.bind_address)
-                .await
-                .map_err(|e| BloklidError::NonSpecific(format!("Failed to bind API server: {}", e)))?;
-
-            tracing::info!("API server listening on {}", api_config.bind_address);
-            if api_config.playground_enabled {
-                tracing::info!(
-                    "GraphQL Playground available at http://{}/graphql",
-                    api_config.bind_address
-                );
-            }
-
-            // Spawn API server as a background task
-            let handle = tokio::spawn(async move {
-                axum::serve(listener, api_app).await.expect("API server failed");
-            });
-
-            tracing::info!("API server started successfully");
-            Some(handle)
-        } else {
-            tracing::info!("API server disabled in configuration");
-            None
-        };
-
-        tracing::info!("Starting BlokliChain processes");
-
-        // Start all chain processes
-        let process_handles = blokli_chain.start().await?;
-
-        tracing::info!("BlokliChain started successfully");
-
-        (process_handles, api_handle)
-    };
-
-    tracing::info!("daemon running; send SIGHUP to reload config, SIGINT/SIGTERM to stop");
-
-    let mut signals = Signals::new([Signal::Hup, Signal::Int, Signal::Term])?;
-    while let Some(signal) = signals.try_next().await? {
-        match signal {
-            Signal::Hup => {
-                tracing::info!("received SIGHUP; reloading configuration");
-                match args.load_config(true) {
-                    Ok(new_cfg) => {
-                        let mut cfg_guard = config
-                            .write()
-                            .map_err(|_| BloklidError::NonSpecific("failed to lock config".into()))?;
-                        *cfg_guard = new_cfg;
-                        tracing::warn!(
-                            "Configuration reloaded, but running indexer, API, and telemetry continue with original \
-                             settings"
-                        );
-                    }
-                    Err(error) => tracing::error!(%error, "failed to reload configuration"),
-                }
-            }
-            Signal::Int | Signal::Term => {
-                tracing::info!("received SIGINT/SIGTERM; shutting down");
-                break;
-            }
-            _ => {
-                tracing::warn!("received unknown signal; ignoring");
-            }
         }
     }
+}
 
-    // Abort all chain processes
-    for (process_type, handle) in process_handles {
-        tracing::info!(?process_type, "stopping process");
-        handle.abort();
-    }
-    tracing::info!("All BlokliChain processes stopped");
-
-    // Stop API server if it was started
-    if let Some(handle) = api_handle {
-        tracing::info!("Stopping API server");
-        handle.abort();
-        tracing::info!("API server stopped");
-    }
-
-    tracing::info!("bloklid stopped gracefully");
+fn write_example_config(path: &PathBuf) -> Result<()> {
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    file.write_all(include_bytes!("../example-config.toml"))?;
     Ok(())
 }
 
-fn require_database(config: &Config) -> errors::Result<&DatabaseConfig> {
-    config.database.as_ref().ok_or_else(|| {
-        BloklidError::DatabaseNotConfigured(
-            "Database configuration is missing. Ensure either [database] section is present in config file or \
-             BLOKLI_DATABASE_TYPE and BLOKLI_DATABASE_URL are set"
-                .to_string(),
-        )
-    })
+struct RuntimeConfig<'a> {
+    rpc_url: Option<&'a str>,
+    confirmations: u64,
+    max_block_range: u64,
+    poll_interval: Duration,
+    source_poll_interval: Duration,
+    max_rpc_requests_per_sec: u32,
+    backfill_concurrency: usize,
+    network: &'a str,
+    topics: TopicMode,
+    start_block: u64,
+    declarative_sources: &'a [SourceConfig],
+    reconcile_config_sources: bool,
+    contracts: &'a blokli_light::config::ContractsConfig,
+}
+
+async fn run_indexer(database: &Database, config: RuntimeConfig<'_>) -> ExitCode {
+    let Some(rpc_url) = config.rpc_url else {
+        tracing::error!("BLOKLI_LIGHT_RPC_URL or --rpc-url is required to run the indexer");
+        return ExitCode::FAILURE;
+    };
+    let rpc = match RpcClient::new_with_rate_limit(rpc_url, config.max_rpc_requests_per_sec) {
+        Ok(rpc) => rpc,
+        Err(error) => {
+            tracing::error!(%error, "invalid RPC client configuration");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(_lock) = (match database.try_advisory_lock().await {
+        Ok(lock) => lock,
+        Err(error) => {
+            tracing::error!(%error, "failed to acquire indexer advisory lock");
+            return ExitCode::FAILURE;
+        }
+    }) else {
+        tracing::error!("another blokli-light writer already holds the advisory lock");
+        return ExitCode::FAILURE;
+    };
+    let expected_chain_id = match binding_chain_id(config.network) {
+        Ok(chain_id) => chain_id,
+        Err(error) => {
+            tracing::error!(%error, "failed to resolve binding chain ID");
+            return ExitCode::FAILURE;
+        }
+    };
+    let rpc_chain_id = match rpc.chain_id().await {
+        Ok(chain_id) => chain_id,
+        Err(error) => {
+            tracing::error!(%error, "failed to read RPC chain ID");
+            return ExitCode::FAILURE;
+        }
+    };
+    if rpc_chain_id != expected_chain_id {
+        tracing::error!(
+            rpc_chain_id,
+            expected_chain_id,
+            network = config.network,
+            "RPC chain does not match configured network"
+        );
+        return ExitCode::FAILURE;
+    }
+    if let Err(error) = database.ensure_chain_identity(config.network, rpc_chain_id).await {
+        tracing::error!(%error, "database chain identity check failed");
+        return ExitCode::FAILURE;
+    }
+    let topics = match config.topics {
+        TopicMode::Known => BuiltinTopics::Known,
+        TopicMode::All => BuiltinTopics::All,
+    };
+    let mut builtins = match builtin_sources(config.network, topics) {
+        Ok(sources) => sources,
+        Err(error) => {
+            tracing::error!(%error, "failed to resolve built-in sources");
+            return ExitCode::FAILURE;
+        }
+    };
+    if !builtins.iter().any(|source| source.name == "service-registry")
+        && let Some(address) = config.contracts.service_registry.as_deref()
+    {
+        let address = match parse_address(address) {
+            Ok(address) => address,
+            Err(error) => {
+                tracing::error!(%error, "invalid service-registry contract override");
+                return ExitCode::FAILURE;
+            }
+        };
+        let from_block = builtins
+            .first()
+            .map(|source| source.from_block)
+            .unwrap_or(config.start_block);
+        builtins.push(service_registry_source(address, from_block, topics));
+    }
+    for mut source in builtins {
+        if let Some(address) = config.contracts.address_for(&source.name) {
+            source.address = match parse_address(address) {
+                Ok(address) => address,
+                Err(error) => {
+                    tracing::error!(%error, source = %source.name, "invalid built-in contract override");
+                    return ExitCode::FAILURE;
+                }
+            };
+        }
+        if config.start_block != 0 {
+            source.from_block = config.start_block;
+        }
+        if let Err(error) = database.upsert_source(&source).await {
+            tracing::error!(%error, source = %source.name, "failed to reconcile built-in source");
+            return ExitCode::FAILURE;
+        }
+    }
+    for source in config.declarative_sources {
+        if let Err(error) = reconcile_custom_source(database, &rpc, source).await {
+            tracing::error!(%error, source = %source.name, "failed to reconcile declarative source");
+            return ExitCode::FAILURE;
+        }
+    }
+    if config.reconcile_config_sources {
+        let configured_names = config
+            .declarative_sources
+            .iter()
+            .map(|source| source.name.clone())
+            .collect::<Vec<_>>();
+        if let Err(error) = database.disable_removed_config_sources(&configured_names).await {
+            tracing::error!(%error, "failed to disable sources removed from configuration");
+            return ExitCode::FAILURE;
+        }
+    }
+    if let Err(error) = database.ensure_logs_origin().await {
+        tracing::error!(%error, "log origin validation failed");
+        return ExitCode::FAILURE;
+    }
+
+    match run(
+        database,
+        &rpc,
+        IndexerConfig {
+            confirmations: config.confirmations,
+            max_block_range: config.max_block_range,
+            poll_interval: config.poll_interval,
+            source_poll_interval: config.source_poll_interval,
+            backfill_concurrency: config.backfill_concurrency,
+        },
+    )
+    .await
+    {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            tracing::error!(%error, "indexer stopped");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn reconcile_custom_source(database: &Database, rpc: &RpcClient, source: &SourceConfig) -> Result<()> {
+    let address = parse_address(&source.address)?;
+    if !rpc.has_code(&address).await? {
+        bail!("source address {} has no contract code", source.address);
+    }
+    let events = source.events.as_deref().map(normalize_events).transpose()?;
+    database
+        .upsert_config_source(&NewSource {
+            name: source.name.clone(),
+            address,
+            kind: SourceKind::Custom,
+            from_block: source.from_block,
+            events,
+        })
+        .await?;
+    Ok(())
+}
+
+async fn run_status_command(database: &Database) -> ExitCode {
+    let result: Result<()> = async {
+        let chain = database.chain_info().await?;
+        let rows = database.log_count().await?;
+        let lag = chain
+            .head_block
+            .map(|head| head.saturating_sub(chain.last_indexed_block));
+        println!("indexed_block\t{}", chain.last_indexed_block);
+        println!(
+            "head_block\t{}",
+            chain
+                .head_block
+                .map_or_else(|| "unknown".to_owned(), |head| head.to_string())
+        );
+        println!(
+            "lag\t{}",
+            lag.map_or_else(|| "unknown".to_owned(), |lag| lag.to_string())
+        );
+        println!("log_rows\t{rows}");
+        println!("source\tkind\tfrom_block\tindexed_to\tlag\tenabled\taddress");
+        for source in database.list_sources().await? {
+            let source_lag = chain.head_block.map_or_else(
+                || "unknown".to_owned(),
+                |head| {
+                    let indexed_to = u64::try_from(source.indexed_to).unwrap_or_default();
+                    head.saturating_sub(indexed_to).to_string()
+                },
+            );
+            println!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                source.name,
+                match source.kind {
+                    SourceKind::Builtin => "builtin",
+                    SourceKind::Custom => "custom",
+                },
+                source.from_block,
+                source.indexed_to,
+                source_lag,
+                source.enabled,
+                format_address(&source.address)
+            );
+        }
+        Ok(())
+    }
+    .await;
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            tracing::error!(%error, "status command failed");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run_db_command(
+    database: &Database,
+    database_url: &str,
+    reader_user: &str,
+    reader_password: Option<&str>,
+    command: DbCommand,
+) -> ExitCode {
+    let result: Result<()> = async {
+        match command {
+            DbCommand::Reader { admin_url, print_url } => {
+                let password = reader_password
+                    .ok_or_else(|| anyhow!("BLOKLI_LIGHT_READER_PASSWORD or --reader-password is required"))?;
+                if let Some(admin_url) = admin_url {
+                    Database::connect(&admin_url)
+                        .await?
+                        .provision_reader(reader_user, password)
+                        .await?;
+                } else {
+                    database.provision_reader(reader_user, password).await?;
+                }
+                println!("provisioned read-only role {reader_user}");
+                if print_url {
+                    println!(
+                        "DATA_SOURCES={}",
+                        reader_connection_url(database_url, reader_user, password)?
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+    .await;
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            tracing::error!(%error, "database command failed");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn reader_connection_url(database_url: &str, user: &str, password: &str) -> Result<String> {
+    let mut url = Url::parse(database_url)?;
+    url.set_username(user)
+        .map_err(|()| anyhow!("database URL cannot contain a username"))?;
+    url.set_password(Some(password))
+        .map_err(|()| anyhow!("database URL cannot contain a password"))?;
+    Ok(url.into())
+}
+
+async fn run_source_command(database: &Database, rpc_url: Option<&str>, command: SourceCommand) -> ExitCode {
+    let result: Result<()> = match command {
+        SourceCommand::Add {
+            name,
+            address,
+            from_block,
+            events,
+        } => {
+            let rpc_url = match rpc_url {
+                Some(rpc_url) => rpc_url,
+                None => {
+                    tracing::error!("BLOKLI_LIGHT_RPC_URL or --rpc-url is required for source add");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let address = match parse_address(&address) {
+                Ok(address) => address,
+                Err(error) => {
+                    tracing::error!(%error, "invalid source address");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let rpc = match RpcClient::new(rpc_url) {
+                Ok(rpc) => rpc,
+                Err(error) => {
+                    tracing::error!(%error, "invalid RPC client configuration");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match rpc.has_code(&address).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::error!(address = %format_address(&address), "source address has no contract code at the current head");
+                    return ExitCode::FAILURE;
+                }
+                Err(error) => {
+                    tracing::error!(%error, "failed to validate source contract code");
+                    return ExitCode::FAILURE;
+                }
+            }
+
+            let events = if events.is_empty() {
+                None
+            } else {
+                match normalize_events(&events) {
+                    Ok(events) => Some(events),
+                    Err(error) => {
+                        tracing::error!(%error, "invalid source events");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            };
+            database
+                .upsert_source(&NewSource {
+                    name,
+                    address,
+                    kind: SourceKind::Custom,
+                    from_block,
+                    events,
+                })
+                .await
+                .map(|source| println!("added source {} ({})", source.name, format_address(&source.address)))
+                .map_err(AnyhowError::from)
+        }
+        SourceCommand::Widen { name, events } => match normalize_events(&events) {
+            Ok(events) => database
+                .widen_source(&name, &events)
+                .await
+                .map(|source| println!("widened source {}", source.name))
+                .map_err(AnyhowError::from),
+            Err(error) => Err(error.into()),
+        },
+        SourceCommand::Disable { name } => database
+            .disable_source(&name)
+            .await
+            .map(|()| println!("disabled source {name}"))
+            .map_err(AnyhowError::from),
+        SourceCommand::List => database
+            .list_sources()
+            .await
+            .map(|sources| {
+                for source in sources {
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}\t{}",
+                        source.name,
+                        format_address(&source.address),
+                        match source.kind {
+                            SourceKind::Builtin => "builtin",
+                            SourceKind::Custom => "custom",
+                        },
+                        source.from_block,
+                        source.indexed_to,
+                        source.enabled
+                    );
+                }
+            })
+            .map_err(AnyhowError::from),
+    };
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            tracing::error!(%error, "source command failed");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Args, Command, SourceCommand};
+
+    #[test]
+    fn event_signatures_with_commas_remain_one_cli_value() {
+        let args = Args::try_parse_from([
+            "blokli-light",
+            "source",
+            "add",
+            "--name",
+            "token",
+            "--address",
+            "0x1234567890123456789012345678901234567890",
+            "--from-block",
+            "1",
+            "--events",
+            "Transfer(address,address,uint256)",
+        ])
+        .expect("valid source arguments");
+
+        let Some(Command::Source {
+            command: SourceCommand::Add { events, .. },
+        }) = args.command
+        else {
+            panic!("source add command expected");
+        };
+        assert_eq!(events, ["Transfer(address,address,uint256)"]);
+    }
 }

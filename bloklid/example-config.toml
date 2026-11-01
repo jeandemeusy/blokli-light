@@ -1,249 +1,43 @@
-# Example configuration for bloklid daemon
-# This serves as a complete working example showing all available options
+# blokli-light example configuration
 
-# Directory for storing data files
-data_directory = "data"
-
-# Network identifier - specifies which HOPR network to connect to
-# Supported networks: jura-dev (default, development), jura-prod (production), piz-palu-dev (development), piz-palu-staging (staging), anvil-localhost (local development)
-# Case-insensitive: anvil_localhost, anvil-localhost, and localhost are also accepted
-network = "jura-dev"
-
-# RPC endpoint URL for connecting to the blockchain
-# Overrides the default RPC endpoint for the selected network
-# If not specified, uses the network's default RPC endpoint (default: http://localhost:8545)
-rpc_url = "http://localhost:8545"
-
-# Maximum number of RPC requests per second (0 for unlimited)
-# If omitted, defaults to 100 req/sec. Set to 0 for unlimited, or a positive value to override the default.
+max_block_range          = 10000
 max_rpc_requests_per_sec = 0
+network                  = "jura-dev"
+rpc_url                  = "https://rpc.gnosischain.com"
 
-# Maximum block range ceiling for adaptive RPC log queries (default: 10000)
-# The effective range is learned from real eth_getLogs requests and reused
-# until the RPC endpoint rejects it. Set to 0 to auto-discover with the
-# default 10000-block ceiling.
-max_block_range = 10000
+# Optional built-in address overrides. Omitted values come from hopr-bindings.
+[contracts]
+# channels = "0x1234567890123456789012345678901234567890"
 
-# Optional Curvy Aggregator proxy. When Curvy indexing is enabled, Blokli
-# resolves the Vault and optional PortalFactory from this contract during startup.
-# This setting does not override any HOPR contract address.
-# curvy_aggregator = "0x0000000000000000000000000000000000000000"
-
-# Optional contract address overrides
-# Defaults are resolved from hopr-bindings for the selected network
-# Use this when running against a local chain with freshly deployed contracts
-# [contracts]
-# token = "0x0000000000000000000000000000000000000000"
-# channels = "0x0000000000000000000000000000000000000000"
-# announcements = "0x0000000000000000000000000000000000000000"
-# module_implementation = "0x0000000000000000000000000000000000000000"
-# node_safe_migration = "0x0000000000000000000000000000000000000000"
-# node_safe_registry = "0x0000000000000000000000000000000000000000"
-# ticket_price_oracle = "0x0000000000000000000000000000000000000000"
-# winning_probability_oracle = "0x0000000000000000000000000000000000000000"
-# node_stake_factory = "0x0000000000000000000000000000000000000000"
-# xhopr_token = "0x0000000000000000000000000000000000000000"
-# The service registry is optional: leave it out, or set it to the zero address, on a network
-# where the contract is not deployed. bloklid then skips it instead of indexing the null address.
-# service_registry = "0x0000000000000000000000000000000000000000"
-
-# Database configuration - supports PostgreSQL or SQLite
-# IMPORTANT: This section is OPTIONAL if using environment variables.
-# For environment-only configuration, comment out this entire [database] section and set:
-#   - BLOKLI_DATABASE_TYPE=postgresql
-#   - BLOKLI_DATABASE_URL=postgresql://user:password@host:port/database
-#   - BLOKLI_DATABASE_MAX_CONNECTIONS=10 (optional, defaults to 10)
+# Operator-defined sources are reconciled into PostgreSQL at startup. Removing an
+# entry disables its config-managed source; stored logs are never deleted.
+# [[sources]]
+# name = "my-vault"
+# address = "0x1234567890123456789012345678901234567890"
+# from_block = 38000000
+# events = ["Deposit(address,uint256)", "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"]
 
 [database]
-# PostgreSQL configuration (recommended for production)
-type = "postgresql"
+max_connections = 5
+url             = "postgresql://blokli_light:password@localhost:5432/blokli_light"
 
-# Option 1: Simple connection URL (recommended)
-url = "postgresql://bloklid:password@localhost:5432/bloklid"
+[database.reader]
+user = "blokli_reader"
+# Password is supplied through BLOKLI_LIGHT_READER_PASSWORD.
 
-# Option 2: Detailed configuration (comment out url above and uncomment fields below)
-# host = "localhost"
-# port = 5432
-# username = "bloklid"
-# password = "password"
-# database = "bloklid"
-# max_connections = 10
-
-# SQLite configuration (alternative to PostgreSQL)
-# SQLite uses two separate database files to avoid write lock contention:
-# - Index database: accounts, channels, announcements, node_info, chain_info
-# - Logs database: log, log_status, log_topic_info tables
-# To use SQLite: comment out the PostgreSQL [database] section above, then uncomment this block
-# [database]
-# type = "sqlite"
-# index_path = "data/bloklid-index.db"  # Use ":memory:" for in-memory database
-# logs_path = "data/bloklid-logs.db"    # Use ":memory:" for in-memory database
-# max_connections = 10
-
-# OpenTelemetry export configuration
-[telemetry]
-# OTLP collector endpoint.
-# Leave this unset to disable OTLP export.
-# Transport is inferred from the scheme:
-# - http:// or https:// -> OTLP/HTTP
-# - grpc:// -> OTLP/gRPC
-# For OTLP/HTTP, use the collector base URL.
-# bloklid appends /v1/traces, /v1/logs, or /v1/metrics internally per signal.
-# For multi-signal export, prefer the collector gRPC endpoint
-# (for example "grpc://localhost:4317").
-otlp_endpoint = "http://localhost:4318"
-
-# Comma-separated OTLP signals to export (default: "metrics")
-# Supported values: "metrics", "traces", "logs"
-# Examples:
-# otlp_signals = "metrics"
-# otlp_signals = "metrics,traces,logs"
-otlp_signals = "metrics"
-
-# Interval between OTLP metric exports (default: 15s; this example uses 60s)
-# Must be greater than 0. Supports humantime syntax like "15s", "1m", or "500ms".
-# Runtime use is limited to OTLP metrics export. Current config validation still
-# requires a value greater than 0 whenever otlp_endpoint is set.
-metric_export_interval = "60s"
-
-# Indexer configuration
 [indexer]
-# Enable fast sync mode for initial synchronization
-fast_sync = true
+# Zero uses the deployment start block from hopr-bindings.
+start_block = 0
+# "known" preserves Blokli event parity; "all" follows every event emitted by
+# built-in addresses. The HOPR token is excluded in both modes.
+backfill_concurrency = 2
+confirmations        = 3
+poll_interval        = "5s"
+source_poll_interval = "30s"
+topics               = "known"
 
-# Enable downloading a `hopr_logs.sql` snapshot archive for faster initial sync
-enable_logs_snapshot = false
-
-# URL to download logs snapshot from (optional)
-logs_snapshot_url = "https://example.com/logs-snapshot.tar.xz"
-
-# Enable indexing of Safe contract events after a Safe has been discovered
-# Safe discovery via registry/stake-factory events remains enabled regardless
-enable_safe_indexing = false
-
-# Enable note/nullifier indexing from the configured Curvy Aggregator.
-# Requires curvy_aggregator and its resolved Vault to be non-zero. A zero
-# PortalFactory is allowed, but Portal-specific GraphQL queries are unavailable.
-enable_curvy_indexing = false
-
-# GraphQL subscription behavior configuration
-[indexer.subscription]
-# Capacity of the event bus buffer for channel events
-# Higher values prevent overflow but use more memory (default: 1000)
-event_bus_capacity = 1000
-
-# Capacity of the shutdown signal buffer
-# Typically a small value is sufficient (default: 10)
-shutdown_signal_capacity = 10
-
-# Batch size for Phase 1 historical channel queries
-# Higher values fetch more data per query but may increase latency (default: 100)
-batch_size = 100
-
-# API server configuration
-[api]
-# Enable or disable the GraphQL API server (default: true)
-enabled = true
-
-# Address and port for the API server to bind to (default: "127.0.0.1:8080")
-bind_address = "127.0.0.1:8080"
-
-# Enable the GraphQL Playground for local development only (default: false)
-playground_enabled = false
-
-# Multiplier applied to EIP-1559 gas estimates exposed by chainInfo
-# A value of 1.0 keeps RPC values unchanged; 1.5 increases maxFeePerGas and
-# maxPriorityFeePerGas by 50% (rounded up to the nearest wei).
-# Must be greater than or equal to 1.
-gas_multiplier = 1.0
-
-# Lower bounds, in wei, for the EIP-1559 fees exposed by chainInfo, applied after
-# gas_multiplier. On Gnosis the RPC estimate is often a 1 wei priority fee with a
-# max fee of only twice the (tiny) base fee, which leaves transactions stuck when
-# blocks fill up. Raising the priority fee keeps the estimate's base fee headroom.
-# Nodes must hold gas_limit x maxFeePerGas upfront (10M gas when signed by hoprd),
-# so keep min_max_fee_per_gas low: 0.005 gwei needs 0.00005 xDAI. The max fee
-# floor only caps the price: transactions pay base fee + priority fee.
-# min_max_fee_per_gas must be greater than or equal to min_priority_fee_per_gas.
-min_max_fee_per_gas      = 5000000 # 0.005 gwei
-min_priority_fee_per_gas = 100     # 100 wei
-
-# Maximum GraphQL query nesting depth. Queries exceeding this are rejected.
-# Real queries reach depth ~4; the default of 8 gives ample headroom.
-max_query_depth = 8
-
-# Maximum GraphQL query complexity budget. Each field costs 1 point by default;
-# RPC-backed resolvers carry higher weights (see query.rs `complexity` attributes).
-# The default of 500 comfortably fits any real query while capping RPC fan-out
-# (e.g. aliased nativeBalance calls) to ~10 per request.
-max_query_complexity = 500
-
-# Transaction submission and optional Safe revert-reason tracing controls.
-[api.transactions]
-# Global and per-signer limits for transactions awaiting receipt monitoring.
-# Set either to 0 for unbounded. Defaults: 1024 and 64 respectively.
-max_submitted_transactions              = 1024
-max_submitted_transactions_per_identity = 64
-
-# Bounds optional debug_traceTransaction enrichment for failed Safe executions.
-# Set either to 0 for unbounded. Defaults: queue 128 jobs and run 2 concurrently.
-max_concurrent_trace_jobs = 2
-max_queued_trace_jobs     = 128
-
-# Set false for RPC providers that do not expose debug_traceTransaction.
-# Safe success/failure status remains available from the transaction receipt.
-enable_revert_reason_tracing = true
-
-# HOPR-aware validation of supported node-management transactions (announcement, channel
-# funding, and outgoing channel closure initiation/finalization). Transactions that are not
-# one of these, or that do not target a known HOPR module, always keep generic behaviour.
-# Blokli performs no balance or allowance pre-check: only conditions decidable from indexed
-# chain state are enforced, so a rejection is never a guess.
-# Defaults to false: enable it once clients understand the rejection and deduplication results.
-enable_hopr_action_validation = true
-
-# How long one logical HOPR action stays deduplicated while its transaction is still tracked.
-# Retries are re-signed with a new nonce, so raw-hash deduplication cannot see them. This is
-# an upper bound; an action whose transaction already concluded is released earlier.
-hopr_action_ttl = "120s"
-
-# Consecutive deterministically invalid submissions of one operation by one signer before
-# that signer is suppressed for that operation. Set to 0 to disable suppression.
-hopr_invalid_action_threshold = 3
-
-# How long the suppression lasts once the threshold is reached.
-hopr_invalid_action_cooldown = "60s"
-
-# SSE keepalive configuration
-[api.sse_keepalive]
-# Enable keepalive comments to prevent idle timeouts (default: true)
-enabled = true
-# Interval between keepalive comments (default: 15s)
-interval = "15s"
-# Comment text sent for keepalive messages (default: "keep-alive")
-text = "keep-alive"
-
-# Health check configuration for Kubernetes probes
-[api.health]
-# Maximum allowed indexer lag before the server reports "not ready"
-#
-# This limit is compared against finality-adjusted blocks from the RPC:
-#   lag = (rpc_block - finality) - indexed_block
-#
-# For jura-dev (Gnosis), finality=3 blocks. So with max_indexer_lag=10:
-# - The indexer can be up to 13 blocks behind the RPC chain head
-# - But must be within 10 blocks of confirmed blocks (with 3 confirmations)
-#
-# This ensures the server doesn't report "ready" when caught up to
-# unconfirmed blocks that might be reorganized.
-#
-# Default: 10 blocks
-max_indexer_lag = 10
-
-# Timeout for health check queries (default: 5s)
-timeout = "5s"
-
-# Interval for periodic readiness checks (default: 60s)
-# This controls how often the cached readiness state is updated by a background task
-# Set lower for faster detection of readiness changes, higher to reduce I/O overhead
-readiness_check_interval = "60s"
+[telemetry]
+# Optional OTLP collector. Supports grpc://, http://, and https:// endpoints.
+# otlp_endpoint = "http://localhost:4318"
+metric_export_interval = "15s"
+otlp_signals           = "metrics"

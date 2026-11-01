@@ -28,32 +28,6 @@ let
     postCheck = "";
   };
 
-  # Wrapper script that provides gawk to the generate-metrics-docs hook.
-  generateMetricsDocsWrapper = pkgs.writeShellScript "generate-metrics-docs-hook" ''
-    export PATH="${lib.makeBinPath [ pkgs.gawk ]}:$PATH"
-    exec bash .github/scripts/generate-metrics-docs.sh --fix
-  '';
-
-  # Wrapper script that provides cargo and other tools to the schema export hook.
-  # Pre-commit system hooks run outside the devshell, so tools must be explicitly
-  # added to PATH.
-  exportDbSchemaWrapper = pkgs.writeShellScript "export-db-schema-hook" ''
-    # Skip in nix build sandbox where cargo can't compile (no network, no system libs).
-    # NIX_BUILD_TOP is set inside all nix build derivations.
-    if [ -n "''${NIX_BUILD_TOP:-}" ]; then
-      echo "Skipping schema export (nix build sandbox detected)"
-      exit 0
-    fi
-    export PATH="${
-      lib.makeBinPath [
-        stableToolchain
-        pkgs.just
-        pkgs.sqlite
-        pkgs.pgformatter
-      ]
-    }:$PATH"
-    exec ${pkgs.just}/bin/just export-generated-schemas
-  '';
 in
 
 pre-commit.lib.${system}.run {
@@ -78,25 +52,6 @@ pre-commit.lib.${system}.run {
 
     # Commit message formatting
     commitizen.enable = true;
-
-    # Export checked-in schemas when migrations or GraphQL API definitions change
-    export-db-schema = {
-      enable = true;
-      name = "generate database and GraphQL schemas";
-      entry = toString exportDbSchemaWrapper;
-      files = "(db/migration/src/.*|api/src/.*|types/src/.*)\\.rs$";
-      language = "system";
-      pass_filenames = false;
-    };
-
-    generate-metrics-docs = {
-      enable = true;
-      name = "METRICS.md must stay in sync with code";
-      entry = toString generateMetricsDocsWrapper;
-      files = "(METRICS\\.md|\\.rs)$";
-      pass_filenames = false;
-      language = "system";
-    };
 
     # Custom immutable files check (disabled by default)
     immutable-files = {

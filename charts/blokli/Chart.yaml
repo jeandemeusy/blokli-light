@@ -1,20 +1,7 @@
 ---
 apiVersion: v2
-name: blokli
-description: Helm chart for Blokli - HOPR on-chain indexer with GraphQL API
+name: blokli-light
+description: PostgreSQL raw-log indexer for HOPR contracts
 type: application
-icon: "https://hoprnet.org/assets/icons/logo.svg"
-version: 0.3.4
-appVersion: "0.10.1"
-keywords:
-  - blokli
-  - hopr
-  - blockchain
-  - indexer
-  - graphql
-home: https://github.com/hoprnet/blokli
-sources:
-  - https://github.com/hoprnet/blokli
-maintainers:
-  - name: HOPR Team
-    email: tech@hoprnet.org
+version: 0.1.0
+appVersion: "0.1.0"

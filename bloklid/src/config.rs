@@ -1,1252 +1,273 @@
-use std::{fmt, time::Duration};
+//! File configuration for the raw-log daemon.
 
-use blokli_chain_indexer::utils::redact_url;
-use blokli_chain_types::{ChainConfig, ContractAddresses};
-use blokli_db::utils::redact_database_url;
-use hopr_types::primitive::primitives::Address;
+use std::{fs, path::Path, time::Duration};
 
-use crate::network::Network;
+use serde::Deserialize;
+use thiserror::Error;
 
-fn default_rpc_url() -> String {
-    "http://localhost:8545".to_string()
-}
-
-fn default_data_directory() -> String {
-    "data".to_string()
-}
-
-fn default_network() -> Network {
-    Network::default()
-}
-
-fn default_max_block_range() -> u32 {
-    10000
-}
-
-/// PostgreSQL database configuration
-///
-/// Supports two formats:
-/// 1. Simple URL: `url = "postgresql://user:pass@host:port/database"`
-/// 2. Detailed components with individual fields (host, port, username, password, database)
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PostgreSqlConfig {
-    /// Connection URL (Option 1: simple URL format)
-    #[serde(default)]
-    pub url: Option<String>,
-    /// Host (Option 2: detailed configuration)
-    #[serde(default)]
-    pub host: Option<String>,
-    /// Port (Option 2: detailed configuration)
-    #[serde(default)]
-    pub port: Option<u16>,
-    /// Username (Option 2: detailed configuration)
-    #[serde(default)]
-    pub username: Option<String>,
-    /// Password (Option 2: detailed configuration)
-    #[serde(default)]
-    pub password: Option<String>,
-    /// Database (Option 2: detailed configuration)
-    #[serde(default)]
-    pub database: Option<String>,
-    /// Maximum number of connections
-    #[serde(default = "default_max_connections")]
-    pub max_connections: u32,
-}
-
-impl fmt::Debug for PostgreSqlConfig {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let url = self.url.as_deref().map(redact_database_url);
-        let password = self.password.as_ref().map(|_| "REDACTED");
-
-        formatter
-            .debug_struct("PostgreSqlConfig")
-            .field("url", &url)
-            .field("host", &self.host)
-            .field("port", &self.port)
-            .field("username", &self.username)
-            .field("password", &password)
-            .field("database", &self.database)
-            .field("max_connections", &self.max_connections)
-            .finish()
-    }
-}
-
-/// SQLite database configuration
-///
-/// SQLite uses two separate database files to avoid write lock contention:
-/// - Index database: Contains accounts, channels, announcements, node_info, chain_info
-/// - Logs database: Contains log, log_status, log_topic_info tables
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SqliteConfig {
-    /// Path to the index SQLite database file (accounts, channels, etc.)
-    /// Use ":memory:" for in-memory database
-    #[serde(default = "default_sqlite_index_path")]
-    pub index_path: String,
-
-    /// Path to the logs SQLite database file (log tables)
-    /// Use ":memory:" for in-memory database
-    #[serde(default = "default_sqlite_logs_path")]
-    pub logs_path: String,
-
-    #[serde(default = "default_max_connections")]
-    pub max_connections: u32,
-}
-
-fn default_sqlite_index_path() -> String {
-    "data/bloklid-index.db".to_string()
-}
-
-fn default_sqlite_logs_path() -> String {
-    "data/bloklid-logs.db".to_string()
-}
-
-/// In-memory database configuration
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct InMemoryConfig {
-    #[serde(default = "default_max_connections")]
-    pub max_connections: u32,
-}
-
-/// Database configuration supporting both PostgreSQL and SQLite
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-pub enum DatabaseConfig {
-    #[serde(rename = "postgresql")]
-    PostgreSql(PostgreSqlConfig),
-    #[serde(rename = "sqlite")]
-    Sqlite(SqliteConfig),
-    #[serde(rename = "in-memory")]
-    InMemory(InMemoryConfig),
-}
-
-fn default_max_connections() -> u32 {
-    10
-}
-
-impl DatabaseConfig {
-    /// Convert database configuration to connection URL
-    /// Constructs a database connection URL.
-    ///
-    /// For PostgreSQL:
-    /// - If `url` is provided in config, returns it directly
-    /// - Otherwise, constructs URL from individual fields with the following defaults:
-    ///   - `host`: "localhost" if not specified
-    ///   - `port`: 5432 if not specified
-    ///   - `username`: empty string if not specified
-    ///   - `password`: empty string if not specified
-    ///   - `database`: empty string if not specified
-    ///
-    /// For SQLite, returns the path with read-write mode enabled.
-    ///
-    /// # Warning
-    ///
-    /// When using detailed PostgreSQL configuration fields instead of a full URL,
-    /// ensure all required connection parameters are provided. Missing parameters
-    /// will use defaults which may result in connection failures.
-    pub fn to_url(&self) -> String {
-        match self {
-            DatabaseConfig::PostgreSql(pg_config) => {
-                // If URL is provided, use it directly
-                if let Some(url) = &pg_config.url {
-                    return url.clone();
-                }
-
-                // Otherwise, construct from detailed fields
-                let username = pg_config.username.as_deref().unwrap_or("");
-                let password = pg_config.password.as_deref().unwrap_or("");
-                let host = pg_config.host.as_deref().unwrap_or("localhost");
-                let port = pg_config.port.unwrap_or(5432);
-                let database = pg_config.database.as_deref().unwrap_or("");
-                format!("postgresql://{}:{}@{}:{}/{}", username, password, host, port, database)
-            }
-            DatabaseConfig::Sqlite(sqlite_config) => {
-                format!("sqlite://{}?mode=rwc", sqlite_config.index_path)
-            }
-            DatabaseConfig::InMemory(_) => "sqlite::memory:".to_string(),
-        }
-    }
-
-    /// Get logs database URL (only applicable for SQLite)
-    /// For PostgreSQL, returns None as it uses a single database
-    /// For SQLite, returns the logs database URL
-    pub fn to_logs_url(&self) -> Option<String> {
-        match self {
-            DatabaseConfig::PostgreSql(_) => None,
-            DatabaseConfig::Sqlite(sqlite_config) => Some(format!("sqlite://{}?mode=rwc", sqlite_config.logs_path)),
-            DatabaseConfig::InMemory(_) => Some("sqlite::memory:".to_string()),
-        }
-    }
-
-    /// Get max_connections setting
-    pub fn max_connections(&self) -> u32 {
-        match self {
-            DatabaseConfig::PostgreSql(pg_config) => pg_config.max_connections,
-            DatabaseConfig::Sqlite(sqlite_config) => sqlite_config.max_connections,
-            DatabaseConfig::InMemory(in_memory_config) => in_memory_config.max_connections,
-        }
-    }
-
-    /// Inform if the db is stored in memory
-    pub fn is_in_memory(&self) -> bool {
-        matches!(self, DatabaseConfig::InMemory(_))
-    }
-
-    /// Display the database configuration with sensitive data redacted
-    pub fn display_redacted(&self) -> String {
-        match self {
-            DatabaseConfig::PostgreSql(pg_config) => {
-                let url_display = if let Some(url) = &pg_config.url {
-                    format!("url={}", redact_database_url(url))
-                } else {
-                    let host = pg_config.host.as_deref().unwrap_or("localhost");
-                    let port = pg_config.port.unwrap_or(5432);
-                    let user = if pg_config.username.is_some() {
-                        "configured".to_string()
-                    } else {
-                        "REDACTED".to_string()
-                    };
-                    let pass = pg_config
-                        .password
-                        .as_ref()
-                        .map(|_| "REDACTED".to_string())
-                        .unwrap_or("(none)".to_string());
-                    let db = pg_config.database.as_deref().unwrap_or("bloklid");
-                    format!(
-                        "host={}, port={}, user={}, password={}, database={}",
-                        host, port, user, pass, db
-                    )
-                };
-                format!(
-                    "PostgreSQL: {}, max_connections={}",
-                    url_display, pg_config.max_connections
-                )
-            }
-            DatabaseConfig::Sqlite(sqlite_config) => {
-                format!(
-                    "SQLite: index_path={}, logs_path={}, max_connections={}",
-                    sqlite_config.index_path, sqlite_config.logs_path, sqlite_config.max_connections
-                )
-            }
-            DatabaseConfig::InMemory(in_memory_config) => {
-                format!(
-                    "In-Memory Database: max_connections={}",
-                    in_memory_config.max_connections
-                )
-            }
-        }
-    }
-}
-
-#[serde_with::serde_as]
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, smart_default::SmartDefault, validator::Validate)]
+/// Daemon configuration loaded from TOML.
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    #[serde(default)]
-    pub database: Option<DatabaseConfig>,
-
-    #[default(_code = "default_data_directory()")]
-    #[serde(default = "default_data_directory")]
-    pub data_directory: String,
-
-    #[default(_code = "default_network()")]
+    /// HOPR binding network name.
     #[serde(default = "default_network")]
-    pub network: Network,
-
-    #[default(_code = "default_rpc_url()")]
+    pub network: String,
+    /// Ethereum HTTP RPC endpoint.
     #[serde(default = "default_rpc_url")]
     pub rpc_url: String,
-
-    #[serde(default)]
-    pub max_rpc_requests_per_sec: Option<u32>,
-
-    #[default(10000)]
+    /// Initial log-request range limit.
     #[serde(default = "default_max_block_range")]
-    pub max_block_range: u32,
-
+    pub max_block_range: u64,
+    /// Maximum JSON-RPC request rate. Zero disables throttling.
+    #[serde(default)]
+    pub max_rpc_requests_per_sec: u32,
+    /// Optional built-in address overrides.
+    #[serde(default)]
+    pub contracts: ContractsConfig,
+    /// PostgreSQL writer connection settings.
+    pub database: DatabaseConfig,
+    /// Indexer progress and source polling settings.
     #[serde(default)]
     pub indexer: IndexerConfig,
-
+    /// Declarative custom sources reconciled at startup.
     #[serde(default)]
-    pub api: ApiConfig,
-
+    pub sources: Vec<SourceConfig>,
+    /// Optional OpenTelemetry export settings.
     #[serde(default)]
     pub telemetry: TelemetryConfig,
+}
 
-    #[serde(default, rename = "contracts")]
-    pub contracts_override: Option<ContractAddresses>,
-
-    /// Optional Curvy Aggregator proxy address. The Vault and optional
-    /// PortalFactory addresses are resolved from this contract during startup.
-    /// This overrides the value in `[contracts]` when both are configured.
-    #[serde_as(as = "Option<serde_with::DisplayFromStr>")]
+/// PostgreSQL writer connection settings.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DatabaseConfig {
+    /// PostgreSQL URL used by the daemon writer.
+    pub url: String,
+    /// Maximum writer-pool connections.
+    #[serde(default = "default_max_connections")]
+    pub max_connections: u32,
+    /// Optional reader role settings.
     #[serde(default)]
-    pub curvy_aggregator: Option<Address>,
+    pub reader: ReaderConfig,
+}
 
-    #[serde(skip)]
-    #[default(None)]
-    pub chain_network: Option<ChainConfig>,
+/// Optional read-only role settings.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReaderConfig {
+    /// Reader login name.
+    #[serde(default = "default_reader_user")]
+    pub user: String,
+}
 
-    #[serde(skip)]
-    #[default(_code = "ContractAddresses::default()")]
-    pub contracts: ContractAddresses,
+impl Default for ReaderConfig {
+    fn default() -> Self {
+        Self {
+            user: default_reader_user(),
+        }
+    }
+}
+
+/// Optional overrides for addresses supplied by `hopr-bindings`.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContractsConfig {
+    pub channels: Option<String>,
+    pub announcements: Option<String>,
+    pub node_safe_registry: Option<String>,
+    pub node_stake_factory: Option<String>,
+    pub ticket_price_oracle: Option<String>,
+    pub winning_probability_oracle: Option<String>,
+    pub service_registry: Option<String>,
+}
+
+impl ContractsConfig {
+    /// Returns the override corresponding to a stable built-in source name.
+    pub fn address_for(&self, source_name: &str) -> Option<&str> {
+        match source_name {
+            "channels" => self.channels.as_deref(),
+            "announcements" => self.announcements.as_deref(),
+            "node-safe-registry" => self.node_safe_registry.as_deref(),
+            "node-stake-factory" => self.node_stake_factory.as_deref(),
+            "ticket-price-oracle" => self.ticket_price_oracle.as_deref(),
+            "winning-probability-oracle" => self.winning_probability_oracle.as_deref(),
+            "service-registry" => self.service_registry.as_deref(),
+            _ => None,
+        }
+    }
+}
+
+/// Indexing policy settings.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndexerConfig {
+    /// Overrides the bindings start block when non-zero.
+    #[serde(default)]
+    pub start_block: u64,
+    /// Built-in source event selection.
+    #[serde(default)]
+    pub topics: TopicsMode,
+    /// Interval for observing custom-source changes.
+    #[serde(default = "default_source_poll_interval", with = "humantime_serde")]
+    pub source_poll_interval: Duration,
+    /// Maximum concurrent custom-source backfills.
+    #[serde(default = "default_backfill_concurrency")]
+    pub backfill_concurrency: usize,
+    /// Finality depth subtracted from the RPC head.
+    #[serde(default = "default_confirmations")]
+    pub confirmations: u64,
+    /// Delay between head polling iterations.
+    #[serde(default = "default_poll_interval", with = "humantime_serde")]
+    pub poll_interval: Duration,
+}
+
+impl Default for IndexerConfig {
+    fn default() -> Self {
+        Self {
+            start_block: 0,
+            topics: TopicsMode::Known,
+            source_poll_interval: default_source_poll_interval(),
+            backfill_concurrency: default_backfill_concurrency(),
+            confirmations: default_confirmations(),
+            poll_interval: default_poll_interval(),
+        }
+    }
+}
+
+/// Built-in event selection policy.
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TopicsMode {
+    #[default]
+    Known,
+    All,
+}
+
+/// Declarative custom source.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceConfig {
+    /// Stable source name.
+    pub name: String,
+    /// Contract address.
+    pub address: String,
+    /// First block to index.
+    pub from_block: u64,
+    /// Omitted means every event for this address.
+    pub events: Option<Vec<String>>,
+}
+
+/// OpenTelemetry Protocol export settings.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetryConfig {
+    /// Collector base URL. Omitted disables OTLP export.
+    #[serde(default)]
+    pub otlp_endpoint: Option<String>,
+    /// Comma-separated subset of `metrics,traces,logs`.
+    #[serde(default = "default_otlp_signals")]
+    pub otlp_signals: String,
+    /// Interval between metric exports.
+    #[serde(default = "default_metric_export_interval", with = "humantime_serde")]
+    pub metric_export_interval: Duration,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            otlp_endpoint: None,
+            otlp_signals: default_otlp_signals(),
+            metric_export_interval: default_metric_export_interval(),
+        }
+    }
 }
 
 impl Config {
-    /// Display the configuration with sensitive data redacted
-    pub fn display_redacted(&self) -> String {
-        let mut output = String::new();
-        output.push_str("Configuration:\n");
-        output.push_str(&format!("  network: {}\n", self.network));
-        output.push_str(&format!("  rpc_url: {}\n", redact_url(&self.rpc_url)));
-        output.push_str(&format!("  data_directory: {}\n", self.data_directory));
-        output.push_str(&format!(
-            "  max_rpc_requests_per_sec: {:?}\n",
-            self.max_rpc_requests_per_sec
-        ));
-        output.push_str(&format!("  max_block_range: {}\n", self.max_block_range));
-
-        if let Some(db_config) = &self.database {
-            output.push_str(&format!("  database: {}\n", db_config.display_redacted()));
-        } else {
-            output.push_str("  database: (not configured)\n");
-        }
-
-        output.push_str(&format!("  indexer.fast_sync: {}\n", self.indexer.fast_sync));
-        output.push_str(&format!(
-            "  indexer.enable_logs_snapshot: {}\n",
-            self.indexer.enable_logs_snapshot
-        ));
-        output.push_str(&format!(
-            "  indexer.enable_safe_indexing: {}\n",
-            self.indexer.enable_safe_indexing
-        ));
-        output.push_str(&format!(
-            "  indexer.enable_curvy_indexing: {}\n",
-            self.indexer.enable_curvy_indexing
-        ));
-
-        if let Some(snapshot_url) = &self.indexer.logs_snapshot_url {
-            output.push_str(&format!("  indexer.logs_snapshot_url: {}\n", redact_url(snapshot_url)));
-        }
-
-        output.push_str(&format!("  api.enabled: {}\n", self.api.enabled));
-        output.push_str(&format!("  api.bind_address: {}\n", self.api.bind_address));
-        output.push_str(&format!("  api.playground_enabled: {}\n", self.api.playground_enabled));
-        output.push_str(&format!("  api.gas_multiplier: {}\n", self.api.gas_multiplier));
-        output.push_str(&format!(
-            "  api.min_priority_fee_per_gas: {}\n",
-            self.api.min_priority_fee_per_gas
-        ));
-        output.push_str(&format!(
-            "  api.min_max_fee_per_gas: {}\n",
-            self.api.min_max_fee_per_gas
-        ));
-        output.push_str(&format!("  api.max_query_depth: {}\n", self.api.max_query_depth));
-        output.push_str(&format!(
-            "  api.max_query_complexity: {}\n",
-            self.api.max_query_complexity
-        ));
-        output.push_str(&format!(
-            "  api.transactions.max_submitted_transactions: {}\n",
-            self.api.transactions.max_submitted_transactions
-        ));
-        output.push_str(&format!(
-            "  api.transactions.max_submitted_transactions_per_identity: {}\n",
-            self.api.transactions.max_submitted_transactions_per_identity
-        ));
-        output.push_str(&format!(
-            "  api.transactions.max_queued_trace_jobs: {}\n",
-            self.api.transactions.max_queued_trace_jobs
-        ));
-        output.push_str(&format!(
-            "  api.transactions.max_concurrent_trace_jobs: {}\n",
-            self.api.transactions.max_concurrent_trace_jobs
-        ));
-        output.push_str(&format!(
-            "  api.transactions.enable_revert_reason_tracing: {}\n",
-            self.api.transactions.enable_revert_reason_tracing
-        ));
-        output.push_str(&format!(
-            "  api.transactions.enable_hopr_action_validation: {}\n",
-            self.api.transactions.enable_hopr_action_validation
-        ));
-        output.push_str(&format!(
-            "  api.transactions.hopr_action_ttl: {:?}\n",
-            self.api.transactions.hopr_action_ttl
-        ));
-        output.push_str(&format!(
-            "  api.transactions.hopr_invalid_action_threshold: {}\n",
-            self.api.transactions.hopr_invalid_action_threshold
-        ));
-        output.push_str(&format!(
-            "  api.transactions.hopr_invalid_action_cooldown: {:?}\n",
-            self.api.transactions.hopr_invalid_action_cooldown
-        ));
-        output.push_str(&format!(
-            "  api.sse_keepalive.enabled: {}\n",
-            self.api.sse_keepalive.enabled
-        ));
-        output.push_str(&format!(
-            "  api.sse_keepalive.interval: {:?}\n",
-            self.api.sse_keepalive.interval
-        ));
-        output.push_str(&format!("  api.sse_keepalive.text: {}\n", self.api.sse_keepalive.text));
-        output.push_str(&format!(
-            "  api.health.max_indexer_lag: {}\n",
-            self.api.health.max_indexer_lag
-        ));
-        output.push_str(&format!("  api.health.timeout: {:?}\n", self.api.health.timeout));
-        output.push_str(&format!(
-            "  api.health.readiness_check_interval: {:?}\n",
-            self.api.health.readiness_check_interval
-        ));
-        output.push_str(&format!(
-            "  telemetry.metric_export_interval: {:?}\n",
-            self.telemetry.metric_export_interval
-        ));
-        output.push_str(&format!("  telemetry.otlp_signals: {}\n", self.telemetry.otlp_signals));
-        if let Some(otlp_endpoint) = &self.telemetry.otlp_endpoint {
-            output.push_str(&format!("  telemetry.otlp_endpoint: {}\n", redact_url(otlp_endpoint)));
-        }
-
-        output
+    /// Loads and validates one TOML configuration file.
+    pub fn from_file(path: &Path) -> Result<Self, ConfigError> {
+        let contents = fs::read_to_string(path).map_err(ConfigError::Read)?;
+        let config = toml::from_str(&contents).map_err(ConfigError::Parse)?;
+        Ok(config)
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, smart_default::SmartDefault)]
-#[serde(deny_unknown_fields)]
-pub struct TelemetryConfig {
-    #[serde(default)]
-    pub otlp_endpoint: Option<String>,
-
-    #[default(_code = "Duration::from_secs(15)")]
-    #[serde(default = "default_metric_export_interval", with = "humantime_serde")]
-    pub metric_export_interval: Duration,
-
-    #[default(_code = "default_otlp_signals()")]
-    #[serde(default = "default_otlp_signals")]
-    pub otlp_signals: String,
+fn default_network() -> String {
+    "jura-dev".to_owned()
 }
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, smart_default::SmartDefault)]
-#[serde(deny_unknown_fields)]
-pub struct IndexerConfig {
-    #[default(true)]
-    #[serde(default = "default_true")]
-    pub fast_sync: bool,
-
-    #[default(false)]
-    #[serde(default = "default_false")]
-    pub enable_logs_snapshot: bool,
-
-    #[default(false)]
-    #[serde(default = "default_false")]
-    pub enable_safe_indexing: bool,
-
-    #[default(false)]
-    #[serde(default = "default_false")]
-    pub enable_curvy_indexing: bool,
-
-    #[serde(default)]
-    pub logs_snapshot_url: Option<String>,
-
-    #[serde(default)]
-    pub subscription: SubscriptionConfig,
+fn default_rpc_url() -> String {
+    "http://localhost:8545".to_owned()
 }
-
-/// Configuration for GraphQL subscription behavior
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, smart_default::SmartDefault)]
-#[serde(deny_unknown_fields)]
-pub struct SubscriptionConfig {
-    /// Capacity of the event bus buffer for channel events
-    /// Higher values prevent overflow but use more memory
-    #[default(1000)]
-    #[serde(default = "default_event_bus_capacity")]
-    pub event_bus_capacity: usize,
-
-    /// Capacity of the shutdown signal buffer
-    /// Typically a small value is sufficient
-    #[default(10)]
-    #[serde(default = "default_shutdown_signal_capacity")]
-    pub shutdown_signal_capacity: usize,
-
-    /// Batch size for Phase 1 historical channel queries
-    /// Higher values fetch more data per query but may increase latency
-    #[default(100)]
-    #[serde(default = "default_batch_size")]
-    pub batch_size: usize,
+const fn default_max_block_range() -> u64 {
+    10_000
 }
-
-#[serde_with::serde_as]
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, smart_default::SmartDefault)]
-#[serde(deny_unknown_fields)]
-pub struct ApiConfig {
-    #[default(true)]
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-
-    #[serde_as(as = "serde_with::DisplayFromStr")]
-    #[default(_code = "default_api_bind_address()")]
-    #[serde(default = "default_api_bind_address")]
-    pub bind_address: std::net::SocketAddr,
-
-    #[default(false)]
-    #[serde(default = "default_false")]
-    pub playground_enabled: bool,
-
-    #[default(1.0)]
-    #[serde(default = "default_api_gas_multiplier")]
-    pub gas_multiplier: f64,
-
-    #[default(blokli_api::config::DEFAULT_MIN_PRIORITY_FEE_PER_GAS)]
-    #[serde(default = "default_api_min_priority_fee_per_gas")]
-    pub min_priority_fee_per_gas: u64,
-
-    #[default(blokli_api::config::DEFAULT_MIN_MAX_FEE_PER_GAS)]
-    #[serde(default = "default_api_min_max_fee_per_gas")]
-    pub min_max_fee_per_gas: u64,
-
-    #[serde(default)]
-    pub sse_keepalive: SseKeepAliveConfig,
-
-    #[serde(default)]
-    pub health: HealthConfig,
-
-    #[serde(default)]
-    pub transactions: TransactionConfig,
-
-    #[default(8)]
-    #[serde(default = "default_max_query_depth")]
-    pub max_query_depth: usize,
-
-    #[default(500)]
-    #[serde(default = "default_max_query_complexity")]
-    pub max_query_complexity: usize,
+const fn default_max_connections() -> u32 {
+    5
 }
-
-/// Configuration for transaction submission and optional Safe revert tracing.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, smart_default::SmartDefault)]
-#[serde(deny_unknown_fields)]
-pub struct TransactionConfig {
-    /// Global limit for transactions awaiting receipt monitoring. `0` means unbounded.
-    ///
-    /// Applies to asynchronous submissions only, since they are the only ones
-    /// tracked by the background receipt monitor.
-    #[default(1024)]
-    #[serde(default = "default_max_submitted_transactions")]
-    pub max_submitted_transactions: usize,
-
-    /// Per-signer limit for transactions awaiting receipt monitoring. `0` means unbounded.
-    #[default(64)]
-    #[serde(default = "default_max_submitted_transactions_per_identity")]
-    pub max_submitted_transactions_per_identity: usize,
-
-    /// Maximum number of optional Safe revert-reason trace jobs waiting to run. `0` means unbounded.
-    #[default(128)]
-    #[serde(default = "default_max_queued_trace_jobs")]
-    pub max_queued_trace_jobs: usize,
-
-    /// Number of concurrent optional Safe revert-reason trace jobs. `0` means unbounded.
-    #[default(2)]
-    #[serde(default = "default_max_concurrent_trace_jobs")]
-    pub max_concurrent_trace_jobs: usize,
-
-    /// Whether to request optional Safe revert reasons through debug tracing.
-    #[default(true)]
-    #[serde(default = "default_true")]
-    pub enable_revert_reason_tracing: bool,
-
-    /// Whether to apply the HOPR-aware policy to supported HOPR node-management transactions.
-    ///
-    /// When disabled, every transaction keeps generic Blokli behaviour. Transactions the
-    /// policy does not recognise are unaffected either way.
-    ///
-    /// Off unless set explicitly, so an existing deployment does not start rejecting or
-    /// deduplicating transactions before its clients understand the new result types.
-    #[default(false)]
-    #[serde(default)]
-    pub enable_hopr_action_validation: bool,
-
-    /// How long one logical HOPR action stays deduplicated while its transaction is tracked.
-    ///
-    /// This is an upper bound: an action whose transaction already concluded is released
-    /// earlier.
-    #[default(_code = "Duration::from_secs(120)")]
-    #[serde(default = "default_hopr_action_ttl", with = "humantime_serde")]
-    pub hopr_action_ttl: Duration,
-
-    /// Consecutive deterministically invalid submissions of one operation by one signer
-    /// before that signer is put on cooldown. `0` disables invalid-action suppression.
-    #[default(3)]
-    #[serde(default = "default_hopr_invalid_action_threshold")]
-    pub hopr_invalid_action_threshold: u32,
-
-    /// How long a signer is suppressed for an operation once the threshold is reached.
-    #[default(_code = "Duration::from_secs(60)")]
-    #[serde(default = "default_hopr_invalid_action_cooldown", with = "humantime_serde")]
-    pub hopr_invalid_action_cooldown: Duration,
+fn default_reader_user() -> String {
+    "blokli_reader".to_owned()
 }
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, smart_default::SmartDefault)]
-#[serde(deny_unknown_fields)]
-pub struct SseKeepAliveConfig {
-    #[default(true)]
-    #[serde(default = "default_sse_keepalive_enabled")]
-    pub enabled: bool,
-
-    #[default(_code = "Duration::from_secs(15)")]
-    #[serde(default = "default_sse_keepalive_interval", with = "humantime_serde")]
-    pub interval: Duration,
-
-    #[default(_code = "default_sse_keepalive_text()")]
-    #[serde(default = "default_sse_keepalive_text")]
-    pub text: String,
+fn default_source_poll_interval() -> Duration {
+    Duration::from_secs(30)
 }
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, smart_default::SmartDefault)]
-#[serde(deny_unknown_fields)]
-pub struct HealthConfig {
-    /// Maximum allowed indexer lag (in blocks) before readiness check fails
-    #[default(10)]
-    #[serde(default = "default_max_indexer_lag")]
-    pub max_indexer_lag: u64,
-
-    /// Timeout for health check queries
-    #[default(_code = "Duration::from_millis(5000)")]
-    #[serde(default = "default_health_timeout", with = "humantime_serde")]
-    pub timeout: Duration,
-
-    /// Interval for periodic readiness checks
-    #[default(_code = "Duration::from_secs(60)")]
-    #[serde(default = "default_readiness_check_interval", with = "humantime_serde")]
-    pub readiness_check_interval: Duration,
-}
-
-fn default_api_bind_address() -> std::net::SocketAddr {
-    "127.0.0.1:8080".parse().unwrap()
-}
-
-// Helper functions for serde defaults that respect SmartDefault values
-fn default_true() -> bool {
-    true
-}
-
-fn default_false() -> bool {
-    false
-}
-
-fn default_event_bus_capacity() -> usize {
-    1000
-}
-
-fn default_shutdown_signal_capacity() -> usize {
-    10
-}
-
-fn default_batch_size() -> usize {
-    100
-}
-
-fn default_sse_keepalive_enabled() -> bool {
-    true
-}
-
-fn default_api_gas_multiplier() -> f64 {
-    1.0
-}
-
-fn default_api_min_priority_fee_per_gas() -> u64 {
-    blokli_api::config::DEFAULT_MIN_PRIORITY_FEE_PER_GAS
-}
-
-fn default_api_min_max_fee_per_gas() -> u64 {
-    blokli_api::config::DEFAULT_MIN_MAX_FEE_PER_GAS
-}
-
-fn default_sse_keepalive_interval() -> Duration {
-    Duration::from_secs(15)
-}
-
-fn default_sse_keepalive_text() -> String {
-    "keep-alive".to_string()
-}
-
-fn default_max_query_depth() -> usize {
-    8
-}
-
-fn default_max_query_complexity() -> usize {
-    500
-}
-
-fn default_max_submitted_transactions() -> usize {
-    1024
-}
-
-fn default_max_submitted_transactions_per_identity() -> usize {
-    64
-}
-
-fn default_max_queued_trace_jobs() -> usize {
-    128
-}
-
-fn default_max_concurrent_trace_jobs() -> usize {
+const fn default_backfill_concurrency() -> usize {
     2
 }
-
-fn default_hopr_action_ttl() -> Duration {
-    Duration::from_secs(120)
-}
-
-fn default_hopr_invalid_action_threshold() -> u32 {
+const fn default_confirmations() -> u64 {
     3
 }
-
-fn default_hopr_invalid_action_cooldown() -> Duration {
-    Duration::from_secs(60)
+fn default_poll_interval() -> Duration {
+    Duration::from_secs(5)
 }
-
-fn default_max_indexer_lag() -> u64 {
-    10
+fn default_otlp_signals() -> String {
+    "metrics".to_owned()
 }
-
-fn default_health_timeout() -> Duration {
-    Duration::from_millis(5000)
-}
-
-fn default_readiness_check_interval() -> Duration {
-    Duration::from_secs(60)
-}
-
 fn default_metric_export_interval() -> Duration {
     Duration::from_secs(15)
 }
 
-fn default_otlp_signals() -> String {
-    "metrics".to_string()
+/// Configuration loading failure.
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    /// File access failed.
+    #[error("failed to read configuration")]
+    Read(#[source] std::io::Error),
+    /// TOML structure was invalid.
+    #[error("invalid configuration")]
+    Parse(#[source] toml::de::Error),
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::time::Duration;
 
-    use hopr_types::primitive::primitives::Address;
-
-    use super::*;
+    use super::{Config, TopicsMode};
 
     #[test]
-    fn test_contract_overrides_from_hex_strings() {
-        let config = r#"
-            [contracts]
-            token = "0x0101010101010101010101010101010101010101"
-            channels = "0x0202020202020202020202020202020202020202"
-            announcements = "0x0303030303030303030303030303030303030303"
-            module_implementation = "0x0404040404040404040404040404040404040404"
-            node_safe_migration = "0x0505050505050505050505050505050505050505"
-            node_safe_registry = "0x0606060606060606060606060606060606060606"
-            ticket_price_oracle = "0x0707070707070707070707070707070707070707"
-            winning_probability_oracle = "0x0808080808080808080808080808080808080808"
-            node_stake_factory = "0x0909090909090909090909090909090909090909"
-            xhopr_token = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            service_registry = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-        "#;
+    fn applies_safe_defaults_to_minimal_configuration() {
+        let config: Config = toml::from_str(
+            r#"
+            [database]
+            url = "postgresql://localhost/blokli_light"
+            "#,
+        )
+        .expect("minimal configuration should parse");
 
-        let config: Config = toml::from_str(config).expect("contracts should accept hex strings");
+        assert_eq!(config.database.max_connections, 5);
+        assert_eq!(config.database.reader.user, "blokli_reader");
+        assert!(matches!(config.indexer.topics, TopicsMode::Known));
+        assert_eq!(config.indexer.source_poll_interval, Duration::from_secs(30));
+        assert_eq!(config.indexer.backfill_concurrency, 2);
+    }
 
-        assert_eq!(
-            config.contracts_override,
-            Some(ContractAddresses {
-                token: Address::from([1; 20]),
-                channels: Address::from([2; 20]),
-                announcements: Address::from([3; 20]),
-                module_implementation: Address::from([4; 20]),
-                node_safe_migration: Address::from([5; 20]),
-                node_safe_registry: Address::from([6; 20]),
-                ticket_price_oracle: Address::from([7; 20]),
-                winning_probability_oracle: Address::from([8; 20]),
-                node_stake_factory: Address::from([9; 20]),
-                xhopr_token: Address::from([0xaa; 20]),
-                curvy_aggregator: Address::default(),
-                curvy_vault: Address::default(),
-                curvy_portal_factory: Address::default(),
-                curvy_shield_router: Address::default(),
-                service_registry: Address::from([0xee; 20]),
-            })
+    #[test]
+    fn rejects_unknown_keys() {
+        let result = toml::from_str::<Config>(
+            r#"
+            unsupported = true
+            [database]
+            url = "postgresql://localhost/blokli_light"
+            "#,
         );
-    }
-
-    /// `service_registry` carries `#[serde(default)]`, so a `[contracts]` block written before
-    /// the registry existed must keep parsing. Without the default every deployed override -
-    /// including `blokli-client/tests/integration/config-integration-anvil.toml` - would break
-    /// on upgrade.
-    #[test]
-    fn test_contract_overrides_default_the_service_registry_when_absent() {
-        let config = r#"
-            [contracts]
-            token = "0x0101010101010101010101010101010101010101"
-            channels = "0x0202020202020202020202020202020202020202"
-            announcements = "0x0303030303030303030303030303030303030303"
-            module_implementation = "0x0404040404040404040404040404040404040404"
-            node_safe_migration = "0x0505050505050505050505050505050505050505"
-            node_safe_registry = "0x0606060606060606060606060606060606060606"
-            ticket_price_oracle = "0x0707070707070707070707070707070707070707"
-            winning_probability_oracle = "0x0808080808080808080808080808080808080808"
-            node_stake_factory = "0x0909090909090909090909090909090909090909"
-        "#;
-
-        let config: Config = toml::from_str(config).expect("a block without the registry should parse");
-
-        let contracts = config
-            .contracts_override
-            .expect("the block should still produce an override");
-
-        // The zero address is the "not deployed" sentinel every consumer must skip.
-        assert_eq!(contracts.service_registry, Address::default());
-        assert_eq!(contracts.xhopr_token, Address::default());
-    }
-
-    #[test]
-    fn test_contract_overrides_default_to_disabled_curvy_indexing() {
-        let config = r#"
-            [contracts]
-            token = "0x0101010101010101010101010101010101010101"
-            channels = "0x0202020202020202020202020202020202020202"
-            announcements = "0x0303030303030303030303030303030303030303"
-            module_implementation = "0x0404040404040404040404040404040404040404"
-            node_safe_migration = "0x0505050505050505050505050505050505050505"
-            node_safe_registry = "0x0606060606060606060606060606060606060606"
-            ticket_price_oracle = "0x0707070707070707070707070707070707070707"
-            winning_probability_oracle = "0x0808080808080808080808080808080808080808"
-            node_stake_factory = "0x0909090909090909090909090909090909090909"
-            xhopr_token = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        "#;
-
-        let config: Config = toml::from_str(config).expect("legacy contract overrides should remain valid");
-
-        assert_eq!(
-            config
-                .contracts_override
-                .expect("contract overrides should be present")
-                .curvy_aggregator,
-            Address::default()
-        );
-    }
-
-    #[test]
-    fn test_curvy_aggregator_can_be_configured_independently() {
-        let config = r#"
-            curvy_aggregator = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-        "#;
-
-        let config: Config = toml::from_str(config).expect("Curvy aggregator should accept a hex string");
-
-        assert_eq!(config.curvy_aggregator, Some(Address::from([0xbb; 20])));
-        assert!(config.contracts_override.is_none());
-    }
-
-    #[test]
-    fn test_strict_parsing() {
-        // Test unknown top-level field
-        let config = r#"
-         unknown_field = "bad"
-         [database]
-         type = "sqlite"
-         index_path = ":memory:"
-         logs_path = ":memory:"
-     "#;
-        let res: Result<Config, _> = toml::from_str(config);
-        assert!(res.is_err(), "Should fail on unknown field");
-
-        // Test unknown nested field
-        let config = r#"
-         [indexer]
-         fast_sync = true
-         unknown_indexer_field = "bad"
-         [database]
-         type = "sqlite"
-         index_path = ":memory:"
-         logs_path = ":memory:"
-     "#;
-        let res: Result<Config, _> = toml::from_str(config);
-        assert!(res.is_err(), "Should fail on unknown nested field");
-
-        // Test invalid type
-        let config = r#"
-         max_rpc_requests_per_sec = "not_a_number"
-         [database]
-         type = "sqlite"
-         index_path = ":memory:"
-         logs_path = ":memory:"
-     "#;
-        let res: Result<Config, _> = toml::from_str(config);
-        assert!(res.is_err(), "Should fail on invalid type");
-    }
-
-    #[test]
-    fn test_sqlite_strict() {
-        let config = r#"
-         [database]
-         type = "sqlite"
-         index_path = ":memory:"
-         logs_path = ":memory:"
-         unknown = "bad"
-     "#;
-        let res: Result<Config, _> = toml::from_str(config);
-        assert!(res.is_err(), "Should fail on unknown sqlite field");
-    }
-
-    #[test]
-    fn test_postgres_detailed_strict() {
-        let config = r#"
-         [database]
-         type = "postgresql"
-         host = "localhost"
-         port = 5432
-         username = "u"
-         password = "p"
-         database = "d"
-         unknown = "bad"
-     "#;
-        let res: Result<Config, _> = toml::from_str(config);
-        assert!(res.is_err(), "Should fail on unknown postgres detailed field");
-    }
-
-    #[test]
-    fn test_postgres_url_strict() {
-        let config = r#"
-         [database]
-         type = "postgresql"
-         url = "postgresql://..."
-         unknown = "bad"
-     "#;
-        let res: Result<Config, _> = toml::from_str(config);
-        assert!(res.is_err(), "Should fail on unknown postgres url field");
-    }
-
-    #[test]
-    fn test_api_strict() {
-        let config = r#"
-         [api]
-         enabled = true
-         unknown_api_field = "bad"
-         [database]
-         type = "sqlite"
-         index_path = ":memory:"
-         logs_path = ":memory:"
-     "#;
-        let res: Result<Config, _> = toml::from_str(config);
-        assert!(res.is_err(), "Should fail on unknown api field");
-    }
-
-    #[test]
-    fn test_telemetry_strict() {
-        let config = r#"
-         [telemetry]
-         otlp_endpoint = "http://localhost:4318/v1/metrics"
-         unknown_telemetry_field = "bad"
-         [database]
-         type = "sqlite"
-         index_path = ":memory:"
-         logs_path = ":memory:"
-     "#;
-        let res: Result<Config, _> = toml::from_str(config);
-        assert!(res.is_err(), "Should fail on unknown telemetry field");
-    }
-
-    #[test]
-    fn test_valid_postgres_config() {
-        let config = r#"
-         [database]
-         type = "postgresql"
-         url = "postgres://..."
-     "#;
-        let res: Result<Config, _> = toml::from_str(config);
-        assert!(res.is_ok(), "Should pass on valid postgres config: {:?}", res.err());
-    }
-
-    #[test]
-    fn test_valid_config() {
-        let config = r#"
-         [database]
-         type = "sqlite"
-         index_path = ":memory:"
-         logs_path = ":memory:"
-     "#;
-        let res: Result<Config, _> = toml::from_str(config);
-        assert!(res.is_ok(), "Should pass on valid config: {:?}", res.err());
-    }
-
-    #[test]
-    fn test_api_sse_keepalive_defaults() {
-        let config = r#"
-         [database]
-         type = "sqlite"
-         index_path = ":memory:"
-         logs_path = ":memory:"
-     "#;
-        let cfg: Config = toml::from_str(config).expect("Failed to parse config");
-        assert!(cfg.api.sse_keepalive.enabled);
-        assert_eq!(cfg.api.sse_keepalive.interval, Duration::from_secs(15));
-        assert_eq!(cfg.api.sse_keepalive.text, "keep-alive");
-    }
-
-    #[test]
-    fn test_api_sse_keepalive_override() {
-        let config = r#"
-         [api.sse_keepalive]
-         enabled = false
-         interval = "5s"
-         text = "ping"
-         [database]
-         type = "sqlite"
-         index_path = ":memory:"
-         logs_path = ":memory:"
-     "#;
-        let cfg: Config = toml::from_str(config).expect("Failed to parse config");
-        assert!(!cfg.api.sse_keepalive.enabled);
-        assert_eq!(cfg.api.sse_keepalive.interval, Duration::from_secs(5));
-        assert_eq!(cfg.api.sse_keepalive.text, "ping");
-    }
-
-    #[test]
-    fn test_config_without_database_section() {
-        let config = r#"
-         network = "jura-dev"
-         rpc_url = "http://localhost:8545"
-     "#;
-        let res: Result<Config, _> = toml::from_str(config);
-        assert!(
-            res.is_ok(),
-            "Should allow config without database section: {:?}",
-            res.err()
-        );
-
-        let cfg = res.unwrap();
-        assert!(cfg.database.is_none(), "database should be None when not specified");
-    }
-
-    #[test]
-    fn test_load_example_config() {
-        let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let config_path = project_root.join("example-config.toml");
-
-        let config_content = fs::read_to_string(&config_path).expect("Failed to read example-config.toml");
-
-        let config: Config = toml::from_str(&config_content).expect("Failed to parse example-config.toml");
-
-        // Basic verification that values are loaded correctly
-        assert_eq!(config.network, Network::JuraDev);
-
-        // Check database config (should be present in example-config.toml)
-        match &config.database {
-            Some(DatabaseConfig::PostgreSql(pg)) => {
-                // Should have a URL configured
-                assert!(pg.url.is_some(), "Example config should have URL configured");
-            }
-            _ => panic!("Example config should have PostgreSQL database section"),
-        }
-
-        // Check indexer config
-        assert!(config.indexer.fast_sync);
-        assert!(!config.indexer.enable_safe_indexing);
-        assert!(!config.indexer.enable_curvy_indexing);
-        assert_eq!(config.indexer.subscription.event_bus_capacity, 1000);
-
-        // Check API config
-        assert!(config.api.enabled);
-        assert_eq!(config.api.bind_address.to_string(), "127.0.0.1:8080");
-        assert_eq!(config.api.gas_multiplier, 1.0);
-        assert_eq!(config.api.max_query_depth, 8);
-        assert_eq!(config.api.max_query_complexity, 500);
-
-        assert!(config.telemetry.otlp_endpoint.is_some());
-        assert_eq!(config.telemetry.metric_export_interval, Duration::from_secs(60));
-        assert_eq!(config.telemetry.otlp_signals, "metrics");
-    }
-
-    #[test]
-    fn test_partial_indexer_config() {
-        // Only set fast_sync, all other fields should use defaults
-        let config = r#"
-         [indexer]
-         fast_sync = false
-         [database]
-         type = "sqlite"
-         index_path = ":memory:"
-         logs_path = ":memory:"
-     "#;
-        let res: Result<Config, _> = toml::from_str(config);
-        assert!(res.is_ok(), "Should allow partial indexer config: {:?}", res.err());
-
-        let cfg = res.unwrap();
-        assert!(!cfg.indexer.fast_sync);
-        assert!(!cfg.indexer.enable_logs_snapshot); // Default
-        assert!(!cfg.indexer.enable_safe_indexing); // Default
-        assert!(!cfg.indexer.enable_curvy_indexing); // Default
-        assert_eq!(cfg.indexer.subscription.event_bus_capacity, 1000); // Default
-        assert_eq!(cfg.indexer.subscription.batch_size, 100); // Default
-    }
-
-    #[test]
-    fn test_partial_api_config() {
-        // Only set enabled, all other fields should use defaults
-        let config = r#"
-         [api]
-         enabled = false
-         [database]
-         type = "sqlite"
-         index_path = ":memory:"
-         logs_path = ":memory:"
-     "#;
-        let res: Result<Config, _> = toml::from_str(config);
-        assert!(res.is_ok(), "Should allow partial api config: {:?}", res.err());
-
-        let cfg = res.unwrap();
-        assert!(!cfg.api.enabled);
-        assert!(!cfg.api.playground_enabled); // Default
-        assert_eq!(cfg.api.bind_address.to_string(), "127.0.0.1:8080"); // Default
-        assert_eq!(cfg.api.gas_multiplier, 1.0); // Default
-        assert_eq!(cfg.api.min_priority_fee_per_gas, 100); // Default
-        assert_eq!(cfg.api.min_max_fee_per_gas, 5_000_000); // Default
-        assert_eq!(cfg.api.health.max_indexer_lag, 10); // Default
-        assert_eq!(cfg.api.health.timeout, Duration::from_millis(5000)); // Default
-        assert!(cfg.database.is_some()); // Database was provided
-    }
-
-    #[test]
-    fn test_api_gas_multiplier_override() {
-        let config = r#"
-         [api]
-         gas_multiplier = 1.5
-         [database]
-         type = "sqlite"
-         index_path = ":memory:"
-         logs_path = ":memory:"
-     "#;
-        let cfg: Config = toml::from_str(config).expect("Failed to parse config");
-        assert_eq!(cfg.api.gas_multiplier, 1.5);
-    }
-
-    #[test]
-    fn test_api_gas_fee_floors_override() {
-        let config = r#"
-         [api]
-         min_priority_fee_per_gas = 100000000
-         min_max_fee_per_gas = 1000000000
-         [database]
-         type = "sqlite"
-         index_path = ":memory:"
-         logs_path = ":memory:"
-     "#;
-        let cfg: Config = toml::from_str(config).expect("Failed to parse config");
-        assert_eq!(cfg.api.min_priority_fee_per_gas, 100_000_000);
-        assert_eq!(cfg.api.min_max_fee_per_gas, 1_000_000_000);
-    }
-
-    #[test]
-    fn test_api_graphql_limits_defaults() {
-        let config = r#"
-         [database]
-         type = "sqlite"
-         index_path = ":memory:"
-         logs_path = ":memory:"
-     "#;
-        let cfg: Config = toml::from_str(config).expect("Failed to parse config");
-        assert_eq!(cfg.api.max_query_depth, 8);
-        assert_eq!(cfg.api.max_query_complexity, 500);
-    }
-
-    #[test]
-    fn test_api_graphql_limits_override() {
-        let config = r#"
-         [api]
-         max_query_depth = 4
-         max_query_complexity = 200
-         [database]
-         type = "sqlite"
-         index_path = ":memory:"
-         logs_path = ":memory:"
-     "#;
-        let cfg: Config = toml::from_str(config).expect("Failed to parse config");
-        assert_eq!(cfg.api.max_query_depth, 4);
-        assert_eq!(cfg.api.max_query_complexity, 200);
-    }
-
-    #[test]
-    fn test_partial_subscription_config() {
-        // Only set event_bus_capacity, other fields should use defaults
-        let config = r#"
-         [indexer.subscription]
-         event_bus_capacity = 500
-         [database]
-         type = "sqlite"
-         index_path = ":memory:"
-         logs_path = ":memory:"
-     "#;
-        let res: Result<Config, _> = toml::from_str(config);
-        assert!(res.is_ok(), "Should allow partial subscription config: {:?}", res.err());
-
-        let cfg = res.unwrap();
-        assert_eq!(cfg.indexer.subscription.event_bus_capacity, 500);
-        assert_eq!(cfg.indexer.subscription.shutdown_signal_capacity, 10); // Default
-        assert_eq!(cfg.indexer.subscription.batch_size, 100); // Default
-    }
-
-    #[test]
-    fn test_postgres_config_debug_redacts_password_field() {
-        let config = PostgreSqlConfig {
-            url: None,
-            host: Some("localhost".to_string()),
-            port: Some(5432),
-            username: Some("blokli".to_string()),
-            password: Some("do-not-log-this-password".to_string()),
-            database: Some("blokli".to_string()),
-            max_connections: 10,
-        };
-
-        let debug_output = format!("{config:?}");
-
-        assert!(!debug_output.contains("do-not-log-this-password"));
-        assert!(debug_output.contains("REDACTED"));
-    }
-
-    #[test]
-    fn test_postgres_config_debug_redacts_password_in_url() {
-        let config = PostgreSqlConfig {
-            url: Some("postgresql://blokli:do-not-log-this-password@localhost:5432/blokli".to_string()),
-            host: None,
-            port: None,
-            username: None,
-            password: None,
-            database: None,
-            max_connections: 10,
-        };
-
-        let debug_output = format!("{config:?}");
-
-        assert!(!debug_output.contains("do-not-log-this-password"));
-        assert!(debug_output.contains("postgresql://REDACTED:REDACTED@localhost:5432/blokli"));
-    }
-
-    #[test]
-    fn test_postgres_config_debug_redacts_password_in_url_query() {
-        let config = PostgreSqlConfig {
-            url: Some("postgresql://localhost:5432/blokli?password=do-not-log-this-password".to_string()),
-            host: None,
-            port: None,
-            username: None,
-            password: None,
-            database: None,
-            max_connections: 10,
-        };
-
-        let debug_output = format!("{config:?}");
-
-        assert!(!debug_output.contains("do-not-log-this-password"));
-        assert!(debug_output.contains("?REDACTED"));
+        assert!(result.is_err());
     }
 }
