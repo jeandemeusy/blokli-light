@@ -1,21 +1,32 @@
-FROM rust:1.99-bookworm AS source
+FROM lukemathwalker/cargo-chef:0.1.78-rust-1.99.1-bookworm@sha256:b75e76d787d5e11dabafa95eecc9fa1b50c38d5e03a38efb99cacb4e02125a76 AS chef
 WORKDIR /src
+
+FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
 COPY bloklid ./bloklid
+RUN cargo chef prepare --recipe-path recipe.json
 
-FROM source AS development-builder
+FROM chef AS dependencies
 ARG TARGETARCH
+COPY --from=planner /src/recipe.json recipe.json
 RUN --mount=type=cache,id=blokli-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,id=blokli-target-${TARGETARCH},target=/src/target,sharing=locked \
+    cargo chef cook --locked --release --recipe-path recipe.json
+
+FROM dependencies AS development-builder
+ARG TARGETARCH
+COPY Cargo.toml Cargo.lock ./
+COPY bloklid ./bloklid
+RUN --mount=type=cache,id=blokli-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry,sharing=locked \
     cargo build --locked --release --bin blokli-light --bin blokli-contract-deployer \
     && mkdir /out \
     && cp /src/target/release/blokli-light /out/blokli-light \
     && cp /src/target/release/blokli-contract-deployer /out/blokli-contract-deployer
 
-FROM source AS production-builder
+FROM dependencies AS production-builder
 ARG TARGETARCH
+COPY Cargo.toml Cargo.lock ./
+COPY bloklid ./bloklid
 RUN --mount=type=cache,id=blokli-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,id=blokli-target-${TARGETARCH},target=/src/target,sharing=locked \
     cargo build --locked --release --bin blokli-light \
     && mkdir /out \
     && cp /src/target/release/blokli-light /out/blokli-light

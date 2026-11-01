@@ -4,7 +4,7 @@ default:
     @just --list
 
 # Required fast validation: format, lint every target, and compile the workspace.
-quick: fmt clippy check
+quick: fmt clippy
 
 # Full local development gate.
 dev: quick test
