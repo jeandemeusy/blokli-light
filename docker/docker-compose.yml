@@ -28,6 +28,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+      target: development
     entrypoint: ["/usr/local/bin/blokli-contract-deployer"]
     command: ["--rpc-url", "http://anvil:8545"]
     depends_on:
@@ -38,6 +39,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+      target: development
     depends_on:
       deploy-contracts:
         condition: service_completed_successfully

@@ -78,3 +78,6 @@ Status is available through the `indexer_status` SQL view and the daemon CLI. `c
 built-in watermark, allowing consumers to calculate lag without an API. Structured text or JSON logs use the standard `RUST_LOG` filter.
 Optional OTLP export sends metrics, traces, and logs to a configured collector; the two daemon gauges expose the observed RPC head and
 committed finalised watermark. No inbound HTTP endpoint is required.
+
+The published production container contains only the daemon. Local integration environments use a separate development container target that
+also carries the contract deployment helper needed to initialise Anvil; that helper is not part of the VPS deployment artifact.
