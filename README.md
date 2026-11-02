@@ -1,19 +1,20 @@
 # blokli-light
 
-`blokli-light` follows HOPR and operator-defined contracts on one EVM chain and stores their logs, unprocessed, in PostgreSQL. SQL tools
-such as Arrakis read the database directly; there is no GraphQL server, transaction API, event handler layer, or derived state.
+`blokli-light` follows deployment-defined contracts on one EVM chain and stores their logs, unprocessed, in PostgreSQL. SQL tools such as
+Arrakis read the database directly; there is no GraphQL server, transaction API, event handler layer, or derived state.
 
 This GPL-3.0-only project is a fork of [`hoprnet/blokli`](https://github.com/hoprnet/blokli) at base commit
 [`2c9ecb7`](https://github.com/hoprnet/blokli/commit/2c9ecb7). Git history is retained for attribution.
 
 ## Data contract
 
-The `log`, `chain_info`, and `log_topic_info` tables retain Blokli's Arrakis-compatible column layout. `source` tracks built-in and custom
-contracts independently, and `indexer_status` exposes per-source lag. Logs are byte-exact: topics are concatenated 32-byte words and event
-data is stored without decoding.
+The `log`, `chain_info`, and `log_topic_info` tables retain Blokli's Arrakis-compatible column layout. `source` tracks configured and
+dynamic contracts independently, and `indexer_status` exposes per-source lag. Logs are byte-exact: topics are concatenated 32-byte words and
+event data is stored without decoding.
 
-Built-in addresses, deployment blocks, and event signatures come from `hopr-bindings`. The token is intentionally excluded unless an
-operator registers it as a custom source.
+Each deployment supplies its EIP-155 chain ID, HOPR deployment label, addresses, deployment blocks, and optional event signatures in its
+configuration. The label is persisted in `chain_info.network` so Arrakis can continue identifying the HOPR network from the database. Run a
+separate deployment and database for each HOPR network.
 
 ## Development
 
@@ -35,8 +36,8 @@ blokli-light generate-config blokli-light.toml
 blokli-light --config config.toml
 ```
 
-The daemon applies SQLx migrations, checks the RPC chain ID against the configured HOPR network, reconciles sources, validates the origin
-guard, acquires a PostgreSQL advisory lock, and resumes from persisted watermarks.
+The daemon applies SQLx migrations, checks the RPC chain ID against the configured chain, reconciles sources, validates the origin guard,
+acquires a PostgreSQL advisory lock, and resumes from persisted watermarks.
 
 Important environment overrides are:
 
@@ -46,12 +47,12 @@ Important environment overrides are:
 | `BLOKLI_LIGHT_DATABASE_URL`                   | PostgreSQL writer URL                       |
 | `BLOKLI_LIGHT_DATABASE_MAX_CONNECTIONS`       | Writer pool size                            |
 | `BLOKLI_LIGHT_RPC_URL`                        | EVM JSON-RPC endpoint                       |
-| `BLOKLI_LIGHT_NETWORK`                        | `hopr-bindings` network name                |
+| `BLOKLI_LIGHT_CHAIN_ID`                       | Expected EIP-155 chain ID                   |
+| `BLOKLI_LIGHT_NETWORK`                        | HOPR deployment label stored in PostgreSQL  |
 | `BLOKLI_LIGHT_MAX_BLOCK_RANGE`                | Initial inclusive `eth_getLogs` range       |
 | `BLOKLI_LIGHT_MAX_RPC_REQUESTS_PER_SEC`       | RPC rate limit; `0` is unlimited            |
 | `BLOKLI_LIGHT_CONFIRMATIONS`                  | Finality depth                              |
 | `BLOKLI_LIGHT_POLL_INTERVAL_SECONDS`          | Head polling interval                       |
-| `BLOKLI_LIGHT_INDEXER_TOPICS`                 | `known` or `all` for built-ins              |
 | `BLOKLI_LIGHT_READER_USER`                    | Direct-SQL reader role name                 |
 | `BLOKLI_LIGHT_READER_PASSWORD`                | Reader password; absence skips provisioning |
 | `BLOKLI_LIGHT_OTLP_ENDPOINT`                  | Optional OTLP collector base URL            |
@@ -60,7 +61,7 @@ Important environment overrides are:
 | `BLOKLI_LIGHT_LOG_FORMAT`                     | Set to `json` for structured logs           |
 | `RUST_LOG`                                    | Standard tracing filter                     |
 
-Custom sources are declared with `[[sources]]` or managed while the daemon runs:
+Deployment sources are declared as `[source.<name>]` or contracts are managed while the daemon runs:
 
 ```bash
 blokli-light source add --name my-vault --address 0x... --from-block 38000000 \
@@ -93,15 +94,15 @@ The indexer subtracts confirmations from the RPC head, adaptively shrinks reject
 recent block hashes after restarts, and commits logs with source progress atomically. Built-in progress remains available at
 `chain_info.last_indexed_block`; custom completeness is `source.indexed_to`.
 
-Optional OTLP export supports gRPC and HTTP collectors without opening an inbound HTTP port. Metrics include `blokli_light_head_block` and
-`blokli_light_indexed_block`; traces and structured logs may be selected alongside metrics.
+Optional OTLP export supports gRPC and HTTP collectors without opening an inbound HTTP port. Metrics include the RPC head and compatibility
+watermarks, per-source indexed-block/lag/enabled gauges, RPC requests by method and outcome, source batch/log/block counters, removed-log
+counters, provider range-limit rejections, and source batch duration. Traces and structured logs may be selected alongside metrics.
 
 ### Docker image and VPS deployment
 
 CI builds the image for `linux/amd64`, suitable for a standard x86-64 Linux VPS. Pull requests validate it without publishing; pushes to
 `main` publish `latest`, `main`, and an immutable `sha-<commit>` tag to GitHub Container Registry. A Git tag such as `v0.1.0` also publishes
-an image with that tag. The published production image contains only the daemon; the local Docker Compose development target additionally
-contains the Anvil contract deployment helper.
+an image with that tag. The published production and local Docker Compose development images contain only the daemon.
 
 ```bash
 docker pull ghcr.io/jeandemeusy/blokli-light:latest
@@ -111,6 +112,7 @@ docker run --detach \
   --restart unless-stopped \
   --env BLOKLI_LIGHT_DATABASE_URL='postgresql://blokli_light:password@postgres.example:5432/blokli_light' \
   --env BLOKLI_LIGHT_RPC_URL='https://your-gnosis-rpc.example' \
+  --env BLOKLI_LIGHT_CHAIN_ID='100' \
   --env BLOKLI_LIGHT_NETWORK='jura-prod' \
   --env BLOKLI_LIGHT_READER_PASSWORD='replace-with-a-long-random-password' \
   ghcr.io/jeandemeusy/blokli-light:latest
@@ -130,8 +132,8 @@ echo "$GHCR_TOKEN" | docker login ghcr.io --username YOUR_GITHUB_USER --password
 For a private image, `GHCR_TOKEN` needs `read:packages`. CI publishes with the repository's built-in `GITHUB_TOKEN`; no additional CI secret
 is required.
 
-For a complete local stack, run `docker compose -f docker/docker-compose.yml up --build --wait`. It starts Anvil and PostgreSQL, deploys the
-HOPR contracts, and waits for blokli-light to begin following the finalised head.
+For a complete local stack, run `docker compose -f docker/docker-compose.yml up --build --wait`. It starts Anvil, PostgreSQL, and the
+indexer. Add sources with the CLI or an explicit configuration file.
 
 See [`design/architecture.md`](design/architecture.md) for data flow and
 [`bloklid/migrations/0001_initial.sql`](bloklid/migrations/0001_initial.sql) for the authoritative schema.

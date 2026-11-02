@@ -1,6 +1,9 @@
 //! Finality-aware raw-log follower and resumable per-source backfill worker.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use thiserror::Error;
 use tokio::{
@@ -124,7 +127,10 @@ pub async fn run_once(database: &Database, rpc: &RpcClient, config: IndexerConfi
     )
     .await?;
 
-    telemetry::record_indexer_state(head, finalised_head);
+    let sources = database.list_sources().await?;
+    let chain_info = database.chain_info().await?;
+    telemetry::record_indexer_state(head, chain_info.last_indexed_block);
+    telemetry::record_source_states(finalised_head, &sources);
 
     Ok(())
 }
@@ -185,10 +191,12 @@ async fn backfill_source(
             from_block: next_block,
             to_block: end_block,
         };
+        let batch_started = Instant::now();
         let logs = match rpc.get_logs(&filter).await {
             Ok(logs) => logs,
             Err(error) if error.is_log_range_limit() && block_range > 1 => {
                 block_range = rpc.note_log_range_limit(block_range);
+                telemetry::record_log_range_limit(&source.name);
                 tracing::warn!(source = %source.name, block_range, "provider limited eth_getLogs range; shrinking");
                 continue;
             }
@@ -199,6 +207,13 @@ async fn backfill_source(
             tracing::warn!(source = %source.name, removed_logs, "RPC returned removed logs");
         }
         database.store_source_batch(&source.name, end_block, &logs).await?;
+        telemetry::record_source_batch(
+            &source.name,
+            end_block.saturating_sub(next_block).saturating_add(1),
+            logs.len(),
+            removed_logs,
+            batch_started.elapsed(),
+        );
         next_block = end_block.saturating_add(1);
         completed_batches += 1;
         if max_batches.is_some_and(|maximum| completed_batches >= maximum) {

@@ -7,7 +7,7 @@ use std::{
     fmt::Debug,
     io::stdout,
     sync::{
-        OnceLock,
+        Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, SystemTime},
@@ -17,6 +17,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use opentelemetry::{
     Key, KeyValue, global,
     logs::{AnyValue, LogRecord as _, Logger as _, LoggerProvider as _, Severity},
+    metrics::{Counter, Histogram},
     trace::TracerProvider as _,
 };
 use opentelemetry_otlp::{LogExporter, MetricExporter, Protocol, SpanExporter, WithExportConfig as _};
@@ -38,13 +39,36 @@ use tracing_subscriber::{
 };
 use url::Url;
 
-use crate::config::TelemetryConfig;
+use crate::{
+    config::TelemetryConfig,
+    database::{Source, SourceKind},
+};
 
 type BoxedLayer = Box<dyn Layer<Registry> + Send + Sync + 'static>;
 
 static OTLP_HANDLE: OnceLock<ReloadHandle<Vec<BoxedLayer>, Registry>> = OnceLock::new();
 static HEAD_BLOCK: AtomicU64 = AtomicU64::new(0);
 static INDEXED_BLOCK: AtomicU64 = AtomicU64::new(0);
+static SOURCE_STATES: OnceLock<Mutex<HashMap<String, SourceMetricState>>> = OnceLock::new();
+static METRICS: OnceLock<Metrics> = OnceLock::new();
+
+#[derive(Clone, Debug)]
+struct SourceMetricState {
+    indexed_block: u64,
+    lag_blocks: u64,
+    enabled: bool,
+    source_type: &'static str,
+}
+
+struct Metrics {
+    rpc_requests: Counter<u64>,
+    source_batches: Counter<u64>,
+    source_blocks: Counter<u64>,
+    source_logs: Counter<u64>,
+    source_removed_logs: Counter<u64>,
+    range_limit_rejections: Counter<u64>,
+    source_batch_duration: Histogram<f64>,
+}
 
 /// Providers kept alive for the lifetime of the daemon and flushed on shutdown.
 #[derive(Default)]
@@ -239,6 +263,7 @@ pub fn configure(config: &TelemetryConfig) -> Result<TelemetryHandles> {
             .build();
         global::set_meter_provider(provider.clone());
         let meter = global::meter(env!("CARGO_PKG_NAME"));
+        let source_states = SOURCE_STATES.get_or_init(|| Mutex::new(HashMap::new()));
         meter
             .u64_observable_gauge("blokli_light_head_block")
             .with_description("Latest Ethereum RPC head observed")
@@ -246,9 +271,60 @@ pub fn configure(config: &TelemetryConfig) -> Result<TelemetryHandles> {
             .build();
         meter
             .u64_observable_gauge("blokli_light_indexed_block")
-            .with_description("Highest finalised built-in block committed")
+            .with_description("Highest finalised deployment-defined block committed")
             .with_callback(|observer| observer.observe(INDEXED_BLOCK.load(Ordering::Relaxed), &[]))
             .build();
+        meter
+            .u64_observable_gauge("blokli_light_source_indexed_block")
+            .with_description("Highest completely indexed block for each source")
+            .with_callback(move |observer| observe_sources(observer, source_states, |source| source.indexed_block))
+            .build();
+        let source_states = SOURCE_STATES.get_or_init(|| Mutex::new(HashMap::new()));
+        meter
+            .u64_observable_gauge("blokli_light_source_lag_blocks")
+            .with_description("Blocks remaining before each source reaches the finalised head")
+            .with_callback(move |observer| observe_sources(observer, source_states, |source| source.lag_blocks))
+            .build();
+        let source_states = SOURCE_STATES.get_or_init(|| Mutex::new(HashMap::new()));
+        meter
+            .u64_observable_gauge("blokli_light_source_enabled")
+            .with_description("Whether each configured or dynamic source is enabled")
+            .with_callback(move |observer| {
+                observe_sources(observer, source_states, |source| u64::from(source.enabled));
+            })
+            .build();
+        let metrics = Metrics {
+            rpc_requests: meter
+                .u64_counter("blokli_light_rpc_requests_total")
+                .with_description("JSON-RPC requests issued by outcome and method")
+                .build(),
+            source_batches: meter
+                .u64_counter("blokli_light_source_batches_total")
+                .with_description("Completed source log-query batches")
+                .build(),
+            source_blocks: meter
+                .u64_counter("blokli_light_source_blocks_total")
+                .with_description("Block ranges successfully indexed by source")
+                .build(),
+            source_logs: meter
+                .u64_counter("blokli_light_source_logs_total")
+                .with_description("Raw logs stored by source")
+                .build(),
+            source_removed_logs: meter
+                .u64_counter("blokli_light_source_removed_logs_total")
+                .with_description("Removed logs observed from RPC by source")
+                .build(),
+            range_limit_rejections: meter
+                .u64_counter("blokli_light_rpc_log_range_limit_rejections_total")
+                .with_description("Provider log-range rejections by source")
+                .build(),
+            source_batch_duration: meter
+                .f64_histogram("blokli_light_source_batch_duration_seconds")
+                .with_description("Elapsed time to fetch and store a source log-query batch")
+                .with_unit("s")
+                .build(),
+        };
+        let _ = METRICS.set(metrics);
         handles.meter_provider = Some(provider);
     }
 
@@ -265,6 +341,86 @@ pub fn configure(config: &TelemetryConfig) -> Result<TelemetryHandles> {
 pub fn record_indexer_state(head_block: u64, indexed_block: u64) {
     HEAD_BLOCK.store(head_block, Ordering::Relaxed);
     INDEXED_BLOCK.store(indexed_block, Ordering::Relaxed);
+}
+
+/// Updates per-source progress gauges using the latest persisted source state.
+pub fn record_source_states(finalised_head: u64, sources: &[Source]) {
+    let states = SOURCE_STATES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut states = states.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    states.clear();
+    for source in sources {
+        let indexed_block = u64::try_from(source.indexed_to).unwrap_or_else(|_| source.from_block.saturating_sub(1));
+        states.insert(
+            source.name.clone(),
+            SourceMetricState {
+                indexed_block,
+                lag_blocks: finalised_head.saturating_sub(indexed_block),
+                enabled: source.enabled,
+                source_type: match source.kind {
+                    SourceKind::Builtin => "configured",
+                    SourceKind::Custom => "dynamic",
+                },
+            },
+        );
+    }
+}
+
+/// Records a completed JSON-RPC request.
+pub fn record_rpc_request(method: &str, success: bool) {
+    if let Some(metrics) = METRICS.get() {
+        metrics.rpc_requests.add(
+            1,
+            &[
+                KeyValue::new("method", method.to_owned()),
+                KeyValue::new("outcome", if success { "success" } else { "error" }),
+            ],
+        );
+    }
+}
+
+/// Records a completed log-query batch and its persisted logs.
+pub fn record_source_batch(source: &str, blocks: u64, logs: usize, removed_logs: usize, duration: Duration) {
+    let Some(metrics) = METRICS.get() else {
+        return;
+    };
+    let attributes = [KeyValue::new("source", source.to_owned())];
+    metrics.source_batches.add(1, &attributes);
+    metrics.source_blocks.add(blocks, &attributes);
+    metrics
+        .source_logs
+        .add(u64::try_from(logs).unwrap_or(u64::MAX), &attributes);
+    metrics
+        .source_removed_logs
+        .add(u64::try_from(removed_logs).unwrap_or(u64::MAX), &attributes);
+    metrics
+        .source_batch_duration
+        .record(duration.as_secs_f64(), &attributes);
+}
+
+/// Records a provider rejection which forced a smaller log-query range.
+pub fn record_log_range_limit(source: &str) {
+    if let Some(metrics) = METRICS.get() {
+        metrics
+            .range_limit_rejections
+            .add(1, &[KeyValue::new("source", source.to_owned())]);
+    }
+}
+
+fn observe_sources(
+    observer: &dyn opentelemetry::metrics::AsyncInstrument<u64>,
+    states: &Mutex<HashMap<String, SourceMetricState>>,
+    value: impl Fn(&SourceMetricState) -> u64,
+) {
+    let states = states.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    for (name, source) in states.iter() {
+        observer.observe(
+            value(source),
+            &[
+                KeyValue::new("source", name.clone()),
+                KeyValue::new("source_type", source.source_type),
+            ],
+        );
+    }
 }
 
 fn identity_if_empty(layers: Vec<BoxedLayer>) -> Vec<BoxedLayer> {

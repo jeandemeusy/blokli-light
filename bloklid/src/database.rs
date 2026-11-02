@@ -28,10 +28,10 @@ pub struct RawLog {
     pub removed: bool,
 }
 
-/// Origin of a watched contract address.
+/// Lifecycle class of a watched contract address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SourceKind {
-    /// A contract address supplied by `hopr-bindings` or the daemon's contract overrides.
+    /// A source declared in the deployment configuration.
     Builtin,
     /// A contract address registered by an operator.
     Custom,
@@ -53,7 +53,7 @@ pub struct NewSource {
     pub name: String,
     /// Contract emitting the logs.
     pub address: [u8; 20],
-    /// Whether the source is supplied by bindings or an operator.
+    /// Whether the source is declared in deployment configuration or added at runtime.
     pub kind: SourceKind,
     /// First block that must be fetched for this source.
     pub from_block: u64,
@@ -88,7 +88,7 @@ pub struct Source {
     pub name: String,
     /// Contract emitting the logs.
     pub address: [u8; 20],
-    /// Whether the source is supplied by bindings or an operator.
+    /// Whether the source is declared in deployment configuration or added at runtime.
     pub kind: SourceKind,
     /// First block that must be fetched for this source.
     pub from_block: u64,
@@ -318,7 +318,7 @@ impl Database {
         }
     }
 
-    /// Inserts or reconciles a source from bindings or operator configuration.
+    /// Inserts or reconciles a source from deployment configuration or runtime management.
     ///
     /// Reconciliation never discards indexed data. Moving `from_block` earlier resets
     /// the source watermark so the missing range is backfilled; moving it later is ignored.
@@ -378,8 +378,8 @@ impl Database {
     /// Disables declarative sources removed from the current configuration without deleting logs.
     pub async fn disable_removed_config_sources(&self, configured_names: &[String]) -> Result<u64, DatabaseError> {
         let result = sqlx::query(
-            "UPDATE source SET enabled = false WHERE kind = 'custom' AND managed_by_config = true AND NOT (name = \
-             ANY($1)) AND enabled = true",
+            "UPDATE source SET enabled = false WHERE managed_by_config = true AND NOT (name = ANY($1)) AND enabled = \
+             true",
         )
         .bind(configured_names)
         .execute(&self.pool)
@@ -450,8 +450,8 @@ impl Database {
 
     /// Primes and verifies the raw-log origin guard.
     ///
-    /// Built-in rows must match exactly once the guard exists. Custom rows are additive and do
-    /// not invalidate a database when operators register new sources.
+    /// Deployment-defined rows must match exactly once the guard exists. Runtime-added rows are
+    /// additive and do not invalidate a database when operators register new sources.
     pub async fn ensure_logs_origin(&self) -> Result<(), DatabaseError> {
         let sources = self.list_sources().await?;
         let mut expected_all = BTreeSet::new();
@@ -772,7 +772,7 @@ pub enum DatabaseError {
     /// A persisted source topic is not a complete 32-byte hash.
     #[error("stored source topic is invalid: {0}")]
     InvalidStoredTopic(String),
-    /// The configured RPC/network differs from the identity already stored in the database.
+    /// The configured chain differs from the identity already stored in the database.
     #[error(
         "database belongs to {stored_network} chain {stored_chain_id}, not {configured_network} chain \
          {configured_chain_id}"
@@ -782,7 +782,7 @@ pub enum DatabaseError {
         stored_network: String,
         /// Previously stored chain ID.
         stored_chain_id: i64,
-        /// Requested network.
+        /// Requested deployment label.
         configured_network: String,
         /// Requested chain ID.
         configured_chain_id: i64,

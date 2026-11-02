@@ -1,19 +1,18 @@
-use std::{fs::OpenOptions, io::Write, path::PathBuf, process::ExitCode, time::Duration};
+use std::{collections::BTreeMap, fs::OpenOptions, io::Write, path::PathBuf, process::ExitCode, time::Duration};
 
 use anyhow::{Error as AnyhowError, Result, anyhow, bail};
 use blokli_light::{
-    builtin::{BuiltinTopics, chain_id as binding_chain_id, service_registry_source, sources as builtin_sources},
-    config::{Config, SourceConfig, TopicsMode},
+    config::{Config, SourceConfig},
     database::{Database, NewSource, SourceKind},
     indexer::{IndexerConfig, run},
     rpc::RpcClient,
     source::{format_address, normalize_events, parse_address},
     telemetry,
 };
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 use url::Url;
 
-/// Raw-log indexer for HOPR and operator-defined Ethereum contracts.
+/// Raw-log indexer for deployment-defined Ethereum contracts.
 #[derive(Debug, Parser)]
 #[command(name = "blokli-light", version, about)]
 struct Args {
@@ -53,34 +52,17 @@ struct Args {
     #[arg(long, env = "BLOKLI_LIGHT_SOURCE_POLL_INTERVAL_SECONDS")]
     source_poll_interval_seconds: Option<u64>,
 
+    /// EIP-155 chain ID expected from the RPC endpoint.
+    #[arg(long, env = "BLOKLI_LIGHT_CHAIN_ID")]
+    chain_id: Option<u64>,
+
+    /// Deployment label persisted in chain_info.network for downstream consumers.
     #[arg(long, env = "BLOKLI_LIGHT_NETWORK")]
     network: Option<String>,
-
-    #[arg(long, env = "BLOKLI_LIGHT_INDEXER_TOPICS", value_enum)]
-    topics: Option<TopicMode>,
-
-    /// Override the bindings start block when non-zero.
-    #[arg(long, env = "BLOKLI_LIGHT_INDEXER_START_BLOCK")]
-    indexer_start_block: Option<u64>,
 
     /// Maximum concurrent lower-priority custom backfills.
     #[arg(long, env = "BLOKLI_LIGHT_BACKFILL_CONCURRENCY")]
     backfill_concurrency: Option<usize>,
-
-    #[arg(long, env = "BLOKLI_LIGHT_CONTRACT_CHANNELS")]
-    contract_channels: Option<String>,
-    #[arg(long, env = "BLOKLI_LIGHT_CONTRACT_ANNOUNCEMENTS")]
-    contract_announcements: Option<String>,
-    #[arg(long, env = "BLOKLI_LIGHT_CONTRACT_NODE_SAFE_REGISTRY")]
-    contract_node_safe_registry: Option<String>,
-    #[arg(long, env = "BLOKLI_LIGHT_CONTRACT_NODE_STAKE_FACTORY")]
-    contract_node_stake_factory: Option<String>,
-    #[arg(long, env = "BLOKLI_LIGHT_CONTRACT_TICKET_PRICE_ORACLE")]
-    contract_ticket_price_oracle: Option<String>,
-    #[arg(long, env = "BLOKLI_LIGHT_CONTRACT_WINNING_PROBABILITY_ORACLE")]
-    contract_winning_probability_oracle: Option<String>,
-    #[arg(long, env = "BLOKLI_LIGHT_CONTRACT_SERVICE_REGISTRY")]
-    contract_service_registry: Option<String>,
 
     /// Read-only PostgreSQL role name.
     #[arg(long, env = "BLOKLI_LIGHT_READER_USER")]
@@ -142,12 +124,6 @@ enum DbCommand {
     },
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum TopicMode {
-    Known,
-    All,
-}
-
 #[derive(Debug, Subcommand)]
 enum SourceCommand {
     /// Add a custom contract source after validating that code exists at its address.
@@ -180,7 +156,7 @@ enum SourceCommand {
         #[arg(long)]
         name: String,
     },
-    /// List built-in and custom source state.
+    /// List deployment-defined and dynamically added source state.
     List,
 }
 
@@ -235,33 +211,6 @@ async fn main() -> ExitCode {
         tracing::error!("BLOKLI_LIGHT_DATABASE_URL or --database-url is required");
         return ExitCode::FAILURE;
     };
-    let mut contract_overrides = file_config
-        .as_ref()
-        .map(|config| config.contracts.clone())
-        .unwrap_or_default();
-    contract_overrides.channels = args.contract_channels.clone().or(contract_overrides.channels);
-    contract_overrides.announcements = args.contract_announcements.clone().or(contract_overrides.announcements);
-    contract_overrides.node_safe_registry = args
-        .contract_node_safe_registry
-        .clone()
-        .or(contract_overrides.node_safe_registry);
-    contract_overrides.node_stake_factory = args
-        .contract_node_stake_factory
-        .clone()
-        .or(contract_overrides.node_stake_factory);
-    contract_overrides.ticket_price_oracle = args
-        .contract_ticket_price_oracle
-        .clone()
-        .or(contract_overrides.ticket_price_oracle);
-    contract_overrides.winning_probability_oracle = args
-        .contract_winning_probability_oracle
-        .clone()
-        .or(contract_overrides.winning_probability_oracle);
-    contract_overrides.service_registry = args
-        .contract_service_registry
-        .clone()
-        .or(contract_overrides.service_registry);
-
     let max_connections = args
         .database_max_connections
         .or_else(|| file_config.as_ref().map(|config| config.database.max_connections));
@@ -309,29 +258,30 @@ async fn main() -> ExitCode {
                 .rpc_url
                 .as_deref()
                 .or_else(|| file_config.as_ref().map(|config| config.rpc_url.as_str()));
+            let chain_id = args
+                .chain_id
+                .or_else(|| file_config.as_ref().map(|config| config.chain.id));
+            let Some(chain_id) = chain_id else {
+                tracing::error!("BLOKLI_LIGHT_CHAIN_ID, --chain-id, or chain.id is required");
+                return ExitCode::FAILURE;
+            };
             let network = args
                 .network
                 .as_deref()
-                .or_else(|| file_config.as_ref().map(|config| config.network.as_str()))
-                .unwrap_or("jura-dev");
+                .or_else(|| file_config.as_ref().map(|config| config.chain.network.as_str()));
+            let Some(network) = network else {
+                tracing::error!("BLOKLI_LIGHT_NETWORK, --network, or chain.network is required");
+                return ExitCode::FAILURE;
+            };
             let max_block_range = args
                 .max_block_range
                 .or_else(|| file_config.as_ref().map(|config| config.max_block_range))
                 .unwrap_or(10_000);
-            let topics =
-                args.topics
-                    .unwrap_or_else(|| match file_config.as_ref().map(|config| config.indexer.topics) {
-                        Some(TopicsMode::All) => TopicMode::All,
-                        _ => TopicMode::Known,
-                    });
+            let empty_sources = BTreeMap::new();
             let declarative_sources = file_config
                 .as_ref()
-                .map(|config| config.sources.as_slice())
-                .unwrap_or_default();
-            let start_block = args
-                .indexer_start_block
-                .or_else(|| file_config.as_ref().map(|config| config.indexer.start_block))
-                .unwrap_or_default();
+                .map(|config| &config.source)
+                .unwrap_or(&empty_sources);
             let reader_user = args
                 .reader_user
                 .as_deref()
@@ -370,12 +320,10 @@ async fn main() -> ExitCode {
                         .backfill_concurrency
                         .or_else(|| file_config.as_ref().map(|config| config.indexer.backfill_concurrency))
                         .unwrap_or(2),
+                    chain_id,
                     network,
-                    topics,
-                    start_block,
                     declarative_sources,
                     reconcile_config_sources: file_config.is_some(),
-                    contracts: &contract_overrides,
                 },
             )
             .await
@@ -397,12 +345,10 @@ struct RuntimeConfig<'a> {
     source_poll_interval: Duration,
     max_rpc_requests_per_sec: u32,
     backfill_concurrency: usize,
+    chain_id: u64,
     network: &'a str,
-    topics: TopicMode,
-    start_block: u64,
-    declarative_sources: &'a [SourceConfig],
+    declarative_sources: &'a BTreeMap<String, SourceConfig>,
     reconcile_config_sources: bool,
-    contracts: &'a blokli_light::config::ContractsConfig,
 }
 
 async fn run_indexer(database: &Database, config: RuntimeConfig<'_>) -> ExitCode {
@@ -427,13 +373,6 @@ async fn run_indexer(database: &Database, config: RuntimeConfig<'_>) -> ExitCode
         tracing::error!("another blokli-light writer already holds the advisory lock");
         return ExitCode::FAILURE;
     };
-    let expected_chain_id = match binding_chain_id(config.network) {
-        Ok(chain_id) => chain_id,
-        Err(error) => {
-            tracing::error!(%error, "failed to resolve binding chain ID");
-            return ExitCode::FAILURE;
-        }
-    };
     let rpc_chain_id = match rpc.chain_id().await {
         Ok(chain_id) => chain_id,
         Err(error) => {
@@ -441,12 +380,11 @@ async fn run_indexer(database: &Database, config: RuntimeConfig<'_>) -> ExitCode
             return ExitCode::FAILURE;
         }
     };
-    if rpc_chain_id != expected_chain_id {
+    if rpc_chain_id != config.chain_id {
         tracing::error!(
             rpc_chain_id,
-            expected_chain_id,
-            network = config.network,
-            "RPC chain does not match configured network"
+            configured_chain_id = config.chain_id,
+            "RPC chain does not match the configured chain"
         );
         return ExitCode::FAILURE;
     }
@@ -454,63 +392,14 @@ async fn run_indexer(database: &Database, config: RuntimeConfig<'_>) -> ExitCode
         tracing::error!(%error, "database chain identity check failed");
         return ExitCode::FAILURE;
     }
-    let topics = match config.topics {
-        TopicMode::Known => BuiltinTopics::Known,
-        TopicMode::All => BuiltinTopics::All,
-    };
-    let mut builtins = match builtin_sources(config.network, topics) {
-        Ok(sources) => sources,
-        Err(error) => {
-            tracing::error!(%error, "failed to resolve built-in sources");
-            return ExitCode::FAILURE;
-        }
-    };
-    if !builtins.iter().any(|source| source.name == "service-registry")
-        && let Some(address) = config.contracts.service_registry.as_deref()
-    {
-        let address = match parse_address(address) {
-            Ok(address) => address,
-            Err(error) => {
-                tracing::error!(%error, "invalid service-registry contract override");
-                return ExitCode::FAILURE;
-            }
-        };
-        let from_block = builtins
-            .first()
-            .map(|source| source.from_block)
-            .unwrap_or(config.start_block);
-        builtins.push(service_registry_source(address, from_block, topics));
-    }
-    for mut source in builtins {
-        if let Some(address) = config.contracts.address_for(&source.name) {
-            source.address = match parse_address(address) {
-                Ok(address) => address,
-                Err(error) => {
-                    tracing::error!(%error, source = %source.name, "invalid built-in contract override");
-                    return ExitCode::FAILURE;
-                }
-            };
-        }
-        if config.start_block != 0 {
-            source.from_block = config.start_block;
-        }
-        if let Err(error) = database.upsert_source(&source).await {
-            tracing::error!(%error, source = %source.name, "failed to reconcile built-in source");
-            return ExitCode::FAILURE;
-        }
-    }
-    for source in config.declarative_sources {
-        if let Err(error) = reconcile_custom_source(database, &rpc, source).await {
-            tracing::error!(%error, source = %source.name, "failed to reconcile declarative source");
+    for (name, source) in config.declarative_sources {
+        if let Err(error) = reconcile_config_source(database, &rpc, name, source).await {
+            tracing::error!(%error, source = %name, "failed to reconcile configured source");
             return ExitCode::FAILURE;
         }
     }
     if config.reconcile_config_sources {
-        let configured_names = config
-            .declarative_sources
-            .iter()
-            .map(|source| source.name.clone())
-            .collect::<Vec<_>>();
+        let configured_names = config.declarative_sources.keys().cloned().collect::<Vec<_>>();
         if let Err(error) = database.disable_removed_config_sources(&configured_names).await {
             tracing::error!(%error, "failed to disable sources removed from configuration");
             return ExitCode::FAILURE;
@@ -542,7 +431,12 @@ async fn run_indexer(database: &Database, config: RuntimeConfig<'_>) -> ExitCode
     }
 }
 
-async fn reconcile_custom_source(database: &Database, rpc: &RpcClient, source: &SourceConfig) -> Result<()> {
+async fn reconcile_config_source(
+    database: &Database,
+    rpc: &RpcClient,
+    name: &str,
+    source: &SourceConfig,
+) -> Result<()> {
     let address = parse_address(&source.address)?;
     if !rpc.has_code(&address).await? {
         bail!("source address {} has no contract code", source.address);
@@ -550,9 +444,9 @@ async fn reconcile_custom_source(database: &Database, rpc: &RpcClient, source: &
     let events = source.events.as_deref().map(normalize_events).transpose()?;
     database
         .upsert_config_source(&NewSource {
-            name: source.name.clone(),
+            name: name.to_owned(),
             address,
-            kind: SourceKind::Custom,
+            kind: SourceKind::Builtin,
             from_block: source.from_block,
             events,
         })
@@ -592,7 +486,7 @@ async fn run_status_command(database: &Database) -> ExitCode {
                 "{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 source.name,
                 match source.kind {
-                    SourceKind::Builtin => "builtin",
+                    SourceKind::Builtin => "configured",
                     SourceKind::Custom => "custom",
                 },
                 source.from_block,
@@ -753,7 +647,7 @@ async fn run_source_command(database: &Database, rpc_url: Option<&str>, command:
                         source.name,
                         format_address(&source.address),
                         match source.kind {
-                            SourceKind::Builtin => "builtin",
+                            SourceKind::Builtin => "configured",
                             SourceKind::Custom => "custom",
                         },
                         source.from_block,

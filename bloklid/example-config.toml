@@ -2,17 +2,25 @@
 
 max_block_range          = 10000
 max_rpc_requests_per_sec = 0
-network                  = "jura-dev"
 rpc_url                  = "https://rpc.gnosischain.com"
 
-# Optional built-in address overrides. Omitted values come from hopr-bindings.
-[contracts]
-# channels = "0x1234567890123456789012345678901234567890"
+[chain]
+# One deployment indexes exactly one chain. Run a separate deployment and database
+# for each network.
+id = 100
+# This opaque label is stored in chain_info.network. Set it to the HOPR network
+# name expected by downstream consumers such as Arrakis.
+network = "jura-prod"
 
-# Operator-defined sources are reconciled into PostgreSQL at startup. Removing an
-# entry disables its config-managed source; stored logs are never deleted.
-# [[sources]]
-# name = "my-vault"
+# Sources are reconciled into PostgreSQL at startup. Removing an entry disables its
+# config-managed source; stored logs are never deleted. Omit events to index every
+# event emitted by the address.
+[source.channels]
+address    = "0x1234567890123456789012345678901234567890"
+from_block = 47415377
+# events = ["ChannelOpened(bytes32,address,address,uint256)"]
+
+# [source.my-vault]
 # address = "0x1234567890123456789012345678901234567890"
 # from_block = 38000000
 # events = ["Deposit(address,uint256)", "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"]
@@ -26,15 +34,10 @@ user = "blokli_reader"
 # Password is supplied through BLOKLI_LIGHT_READER_PASSWORD.
 
 [indexer]
-# Zero uses the deployment start block from hopr-bindings.
-start_block = 0
-# "known" preserves Blokli event parity; "all" follows every event emitted by
-# built-in addresses. The HOPR token is excluded in both modes.
 backfill_concurrency = 2
 confirmations        = 3
 poll_interval        = "5s"
 source_poll_interval = "30s"
-topics               = "known"
 
 [telemetry]
 # Optional OTLP collector. Supports grpc://, http://, and https:// endpoints.

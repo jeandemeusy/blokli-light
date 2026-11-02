@@ -1,0 +1,52 @@
+# HOPR Jura production deployment on Gnosis Chain.
+# Replace the database URL and RPC endpoint for the target environment.
+
+max_block_range          = 10000
+max_rpc_requests_per_sec = 0
+rpc_url                  = "https://rpc.gnosischain.com"
+
+[chain]
+id      = 100
+network = "jura-prod"
+
+[database]
+max_connections = 5
+url             = "postgresql://blokli_light:replace-me@localhost:5432/blokli_light_jura_prod"
+
+[database.reader]
+user = "blokli_reader"
+
+[indexer]
+backfill_concurrency = 2
+confirmations        = 3
+poll_interval        = "5s"
+source_poll_interval = "30s"
+
+[telemetry]
+metric_export_interval = "15s"
+otlp_signals           = "metrics"
+
+# Omit event filters to retain every event emitted by these HOPR contracts.
+[source.channels]
+address    = "0x860f50B24Ba6A862736c5045747323e03aa52Aa4"
+from_block = 47415377
+
+[source.announcements]
+address    = "0xa91976fe366a0BAAA6265cd14613fc7E9a5317C8"
+from_block = 47415377
+
+[source.node-safe-registry]
+address    = "0x3deBB42dD93aa87A246cB25D9A33859368FF5Fd3"
+from_block = 47415377
+
+[source.node-stake-factory]
+address    = "0x172550Ed1D2085Fa7E1D2B7243227Dc567B03B50"
+from_block = 47415377
+
+[source.ticket-price-oracle]
+address    = "0xCD638Cd10913971D6a6C058C4a4BbCF3029D1Df3"
+from_block = 47415377
+
+[source.winning-probability-oracle]
+address    = "0x69081e1a1419C5265B66Ee89081919b9Fb56Ae0E"
+from_block = 47415377

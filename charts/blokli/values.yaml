@@ -25,11 +25,20 @@ reader:
   existingSecret: ""
   passwordKey: BLOKLI_LIGHT_READER_PASSWORD
 
-indexer:
+chain:
+  id: 100
   network: jura-prod
+
+sources: {}
+# Example:
+#   channels:
+#     address: "0x..."
+#     fromBlock: 47415377
+#     events: []
+
+indexer:
   maxBlockRange: 10000
   confirmations: 3
-  topics: known
   pollInterval: 5s
   sourcePollInterval: 30s
   backfillConcurrency: 2

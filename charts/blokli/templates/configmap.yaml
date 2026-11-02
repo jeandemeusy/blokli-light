@@ -4,7 +4,8 @@ metadata:
   name: {{ include "blokli-light.fullname" . }}
 data:
   config.toml: |
-    network = {{ .Values.indexer.network | quote }}
+    chain.id = {{ .Values.chain.id }}
+    chain.network = {{ .Values.chain.network | quote }}
     rpc_url = "http://environment-override.invalid"
     max_block_range = {{ .Values.indexer.maxBlockRange }}
     max_rpc_requests_per_sec = {{ .Values.rpc.maxRequestsPerSecond }}
@@ -13,8 +14,16 @@ data:
     max_connections = {{ .Values.database.maxConnections }}
     [database.reader]
     user = {{ .Values.reader.user | quote }}
+    {{ range $name, $source := .Values.sources }}
+
+    [source.{{ $name | quote }}]
+    address = {{ $source.address | quote }}
+    from_block = {{ $source.fromBlock }}
+    {{ with $source.events }}
+    events = [{{ range $index, $event := . }}{{ if $index }}, {{ end }}{{ $event | quote }}{{ end }}]
+    {{ end }}
+    {{ end }}
     [indexer]
-    topics = {{ .Values.indexer.topics | quote }}
     confirmations = {{ .Values.indexer.confirmations }}
     poll_interval = {{ .Values.indexer.pollInterval | quote }}
     source_poll_interval = {{ .Values.indexer.sourcePollInterval | quote }}

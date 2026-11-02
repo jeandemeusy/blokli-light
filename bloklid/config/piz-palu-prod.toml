@@ -1,0 +1,56 @@
+# HOPR Piz Palu production deployment on Gnosis Chain.
+# Replace the database URL and RPC endpoint for the target environment.
+
+max_block_range          = 10000
+max_rpc_requests_per_sec = 0
+rpc_url                  = "https://rpc.gnosischain.com"
+
+[chain]
+id      = 100
+network = "piz-palu-prod"
+
+[database]
+max_connections = 5
+url             = "postgresql://blokli_light:replace-me@localhost:5432/blokli_light_piz_palu_prod"
+
+[database.reader]
+user = "blokli_reader"
+
+[indexer]
+backfill_concurrency = 2
+confirmations        = 3
+poll_interval        = "5s"
+source_poll_interval = "30s"
+
+[telemetry]
+metric_export_interval = "15s"
+otlp_signals           = "metrics"
+
+# Omit event filters to retain every event emitted by these HOPR contracts.
+[source.channels]
+address    = "0x75Ce59332721E3aE3064cb9652BCE35FFCE3f8E6"
+from_block = 48530952
+
+[source.announcements]
+address    = "0x70219cdf30A44c4c31f5C20f1b7d62eBcef83a32"
+from_block = 48530952
+
+[source.node-safe-registry]
+address    = "0x11a69aFB66D70B48244A90689F190aBcdBf9218c"
+from_block = 48530952
+
+[source.node-stake-factory]
+address    = "0xeb83B9B9381b7ACDBF71Be86C52049f89E5F59b4"
+from_block = 48530952
+
+[source.ticket-price-oracle]
+address    = "0x97f1F28b2d2278E1Ca7aEcc3081dB966b9Ed1A77"
+from_block = 48530952
+
+[source.winning-probability-oracle]
+address    = "0x1A82A09f7b6410Da54106A720Cf97fFB7B815908"
+from_block = 48530952
+
+[source.service-registry]
+address    = "0xC9323cDf98c7faD2dfac182d37CBf3Ef38c2540c"
+from_block = 48530952
