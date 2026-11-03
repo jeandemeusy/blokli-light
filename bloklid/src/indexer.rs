@@ -71,6 +71,7 @@ pub async fn run_once(database: &Database, rpc: &RpcClient, config: IndexerConfi
         i64::try_from(finalised_head).map_err(|_| IndexerError::InvalidFinalisedHead(finalised_head))?;
     let chain_info = database.chain_info().await?;
     let sources = database.list_sources().await?;
+    database.ensure_logs_origin().await?;
 
     let reconciliation_start = finalised_head.saturating_sub(config.confirmations.saturating_mul(2));
     for block_number in reconciliation_start..=finalised_head {
@@ -88,14 +89,13 @@ pub async fn run_once(database: &Database, rpc: &RpcClient, config: IndexerConfi
         .map(|source| source.name.clone())
         .collect::<Vec<_>>();
 
-    let (followers, lagging): (Vec<_>, Vec<_>) =
-        sources.into_iter().filter(|source| source.enabled).partition(|source| {
-            source.kind == SourceKind::Builtin
-                || source.indexed_to >= i64::try_from(chain_info.last_indexed_block).unwrap_or(i64::MAX)
-        });
+    let (followers, lagging): (Vec<_>, Vec<_>) = sources
+        .into_iter()
+        .filter(|source| source.enabled)
+        .partition(|source| source.indexed_to >= i64::try_from(chain_info.last_indexed_block).unwrap_or(i64::MAX));
 
-    // Sources already at the compatibility watermark remain on the head path. A long-running
-    // custom backfill is intentionally deferred so it cannot delay built-in head progress.
+    // Sources already at the compatibility watermark remain on the head path. Any newly added
+    // source backfills at lower priority, so it cannot delay contracts already following the head.
     for source in followers {
         backfill_source(database, rpc, config.max_block_range, finalised_head, &source, None).await?;
     }

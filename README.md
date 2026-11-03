@@ -36,8 +36,8 @@ blokli-light generate-config blokli-light.toml
 blokli-light --config config.toml
 ```
 
-The daemon applies SQLx migrations, checks the RPC chain ID against the configured chain, reconciles sources, validates the origin guard,
-acquires a PostgreSQL advisory lock, and resumes from persisted watermarks.
+The daemon applies SQLx migrations, checks the RPC chain ID against the configured chain, reconciles sources, synchronises source-topic
+metadata, acquires a PostgreSQL advisory lock, and resumes from persisted watermarks.
 
 Important environment overrides are:
 

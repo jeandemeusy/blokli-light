@@ -405,11 +405,6 @@ async fn run_indexer(database: &Database, config: RuntimeConfig<'_>) -> ExitCode
             return ExitCode::FAILURE;
         }
     }
-    if let Err(error) = database.ensure_logs_origin().await {
-        tracing::error!(%error, "log origin validation failed");
-        return ExitCode::FAILURE;
-    }
-
     match run(
         database,
         &rpc,

@@ -448,19 +448,14 @@ impl Database {
         .collect()
     }
 
-    /// Primes and verifies the raw-log origin guard.
+    /// Adds topic metadata for every active source without removing historic metadata.
     ///
-    /// Deployment-defined rows must match exactly once the guard exists. Runtime-added rows are
-    /// additive and do not invalidate a database when operators register new sources.
+    /// Sources are added, disabled, and widened over a deployment's lifetime. Retaining already
+    /// observed topic metadata lets those operations proceed without invalidating direct-SQL
+    /// consumers or deleting historic log context.
     pub async fn ensure_logs_origin(&self) -> Result<(), DatabaseError> {
         let sources = self.list_sources().await?;
         let mut expected_all = BTreeSet::new();
-        let mut expected_builtin = BTreeSet::new();
-        let builtin_addresses = sources
-            .iter()
-            .filter(|source| source.kind == SourceKind::Builtin)
-            .map(|source| source.address.to_vec())
-            .collect::<BTreeSet<_>>();
 
         for source in sources.iter().filter(|source| source.enabled) {
             let topics = match &source.events {
@@ -471,24 +466,8 @@ impl Database {
                 None => vec![vec![0; 32]],
             };
             for topic in topics {
-                let pair = (source.address.to_vec(), topic);
-                if source.kind == SourceKind::Builtin {
-                    expected_builtin.insert(pair.clone());
-                }
-                expected_all.insert(pair);
+                expected_all.insert((source.address.to_vec(), topic));
             }
-        }
-
-        let existing = sqlx::query_as::<_, LogTopicRow>("SELECT address, topic FROM log_topic_info")
-            .fetch_all(&self.pool)
-            .await?;
-        let existing_builtin = existing
-            .iter()
-            .filter(|row| builtin_addresses.contains(&row.address))
-            .map(|row| (row.address.clone(), row.topic.clone()))
-            .collect::<BTreeSet<_>>();
-        if !existing.is_empty() && existing_builtin != expected_builtin {
-            return Err(DatabaseError::LogsOriginMismatch);
         }
 
         let mut transaction = self.pool.begin().await?;
@@ -628,12 +607,6 @@ struct ChainIdentityRow {
     chain_id: Option<i64>,
 }
 
-#[derive(sqlx::FromRow)]
-struct LogTopicRow {
-    address: Vec<u8>,
-    topic: Vec<u8>,
-}
-
 impl TryFrom<ChainInfoRow> for ChainInfo {
     type Error = DatabaseError;
 
@@ -766,9 +739,6 @@ pub enum DatabaseError {
     /// A source batch was committed for a source that is disabled or absent.
     #[error("enabled source '{0}' was not found")]
     EnabledSourceNotFound(String),
-    /// Stored origin rows disagree with the configured built-in contract/topic set.
-    #[error("configured built-in log origin does not match this database")]
-    LogsOriginMismatch,
     /// A persisted source topic is not a complete 32-byte hash.
     #[error("stored source topic is invalid: {0}")]
     InvalidStoredTopic(String),

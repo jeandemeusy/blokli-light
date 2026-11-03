@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use blokli_light::{
-    database::{Database, DatabaseError, NewSource, RawLog, SourceKind},
+    database::{Database, NewSource, RawLog, SourceKind},
     indexer::{IndexerConfig, run_once},
     rpc::RpcClient,
 };
@@ -63,10 +63,23 @@ async fn postgres_storage_origin_and_reader_contract() -> anyhow::Result<()> {
     database.ensure_logs_origin().await?;
     builtin.events = Some(vec![format!("0x{}", hex::encode([11; 32]))]);
     database.upsert_source(&builtin).await?;
-    assert!(matches!(
-        database.ensure_logs_origin().await,
-        Err(DatabaseError::LogsOriginMismatch)
-    ));
+    database.ensure_logs_origin().await?;
+    let topic_count: i64 = sqlx::query_scalar("SELECT count(*) FROM log_topic_info WHERE address = $1")
+        .bind(builtin.address.as_slice())
+        .fetch_one(&admin)
+        .await?;
+    assert_eq!(topic_count, 2);
+
+    database
+        .upsert_config_source(&NewSource {
+            name: "new-configured-contract".to_owned(),
+            address: [10; 20],
+            kind: SourceKind::Builtin,
+            from_block: 10,
+            events: None,
+        })
+        .await?;
+    database.ensure_logs_origin().await?;
 
     let custom = NewSource {
         name: "custom-vault".to_owned(),
