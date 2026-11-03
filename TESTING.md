@@ -23,5 +23,5 @@ FROM log
 ORDER BY 1, 2, 3;
 ```
 
-The result must match byte-for-byte for the built-in contract set. The Arrakis `gnosis-vpn.json` bundle must then produce the same query
-results through the provisioned reader role.
+The result must match byte-for-byte for the deployment-configured contract set. The Arrakis `gnosis-vpn.json` bundle must then produce the
+same query results through the provisioned reader role.

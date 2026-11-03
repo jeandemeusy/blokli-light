@@ -24,30 +24,17 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql
 
-  deploy-contracts:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
-      target: development
-    entrypoint: ["/usr/local/bin/blokli-contract-deployer"]
-    command: ["--rpc-url", "http://anvil:8545"]
-    depends_on:
-      anvil:
-        condition: service_healthy
-
   blokli-light:
     build:
       context: ..
       dockerfile: docker/Dockerfile
       target: development
     depends_on:
-      deploy-contracts:
-        condition: service_completed_successfully
       postgres:
         condition: service_healthy
     environment:
       BLOKLI_LIGHT_DATABASE_URL: postgresql://blokli_light:${POSTGRES_PASSWORD:-blokli_light_dev}@postgres:5432/blokli_light
-      BLOKLI_LIGHT_NETWORK: ${BLOKLI_LIGHT_NETWORK:-anvil-localhost}
+      BLOKLI_LIGHT_CHAIN_ID: ${BLOKLI_LIGHT_CHAIN_ID:-31337}
       BLOKLI_LIGHT_READER_PASSWORD: ${BLOKLI_LIGHT_READER_PASSWORD:-blokli_reader_dev}
       BLOKLI_LIGHT_RPC_URL: ${BLOKLI_LIGHT_RPC_URL:-http://anvil:8545}
       BLOKLI_LIGHT_LOG_FORMAT: json

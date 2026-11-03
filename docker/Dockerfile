@@ -12,16 +12,6 @@ COPY --from=planner /src/recipe.json recipe.json
 RUN --mount=type=cache,id=blokli-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry,sharing=locked \
     cargo chef cook --locked --release --recipe-path recipe.json
 
-FROM dependencies AS development-builder
-ARG TARGETARCH
-COPY Cargo.toml Cargo.lock ./
-COPY bloklid ./bloklid
-RUN --mount=type=cache,id=blokli-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry,sharing=locked \
-    cargo build --locked --release --bin blokli-light --bin blokli-contract-deployer \
-    && mkdir /out \
-    && cp /src/target/release/blokli-light /out/blokli-light \
-    && cp /src/target/release/blokli-contract-deployer /out/blokli-contract-deployer
-
 FROM dependencies AS production-builder
 ARG TARGETARCH
 COPY Cargo.toml Cargo.lock ./
@@ -38,8 +28,7 @@ RUN apt-get update \
 USER 65532:65532
 
 FROM runtime AS development
-COPY --from=development-builder /out/blokli-light /usr/local/bin/blokli-light
-COPY --from=development-builder /out/blokli-contract-deployer /usr/local/bin/blokli-contract-deployer
+COPY --from=production-builder /out/blokli-light /usr/local/bin/blokli-light
 ENTRYPOINT ["/usr/local/bin/blokli-light"]
 
 FROM runtime AS production

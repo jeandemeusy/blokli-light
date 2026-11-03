@@ -16,16 +16,11 @@ workspace = true
 name = "blokli-light"
 path = "src/main.rs"
 
-[[bin]]
-name = "blokli-contract-deployer"
-path = "src/bin/blokli-contract-deployer.rs"
-
 [dependencies]
 alloy-primitives = "1.7.3"
 anyhow = { workspace = true }
 clap = { workspace = true }
 hex = { workspace = true }
-hopr-bindings = { workspace = true }
 humantime-serde = { workspace = true }
 opentelemetry = { workspace = true, features = ["logs", "metrics", "trace"] }
 opentelemetry-otlp = { workspace = true, features = [

@@ -15,7 +15,7 @@ use thiserror::Error;
 use tokio::{sync::Mutex, time::sleep};
 use url::Url;
 
-use crate::{database::RawLog, source::format_address};
+use crate::{database::RawLog, source::format_address, telemetry};
 
 /// Filter sent to `eth_getLogs`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -144,31 +144,36 @@ impl RpcClient {
     }
 
     async fn call<T: DeserializeOwned>(&self, method: &str, params: Value) -> Result<T, RpcError> {
-        self.wait_for_rate_limit().await;
-        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
-        let response = self
-            .client
-            .post(self.url.clone())
-            .json(&json!({
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "method": method,
-                "params": params,
-            }))
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<RpcResponse<T>>()
-            .await?;
+        let result = async {
+            self.wait_for_rate_limit().await;
+            let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+            let response = self
+                .client
+                .post(self.url.clone())
+                .json(&json!({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": method,
+                    "params": params,
+                }))
+                .send()
+                .await?
+                .error_for_status()?
+                .json::<RpcResponse<T>>()
+                .await?;
 
-        if let Some(error) = response.error {
-            return Err(RpcError::Response {
-                code: error.code,
-                message: error.message,
-            });
+            if let Some(error) = response.error {
+                return Err(RpcError::Response {
+                    code: error.code,
+                    message: error.message,
+                });
+            }
+
+            response.result.ok_or(RpcError::MissingResult)
         }
-
-        response.result.ok_or(RpcError::MissingResult)
+        .await;
+        telemetry::record_rpc_request(method, result.is_ok());
+        result
     }
 
     async fn wait_for_rate_limit(&self) {

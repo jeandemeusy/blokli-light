@@ -4,7 +4,6 @@
 //! event payloads and materialising contract state are responsibilities of SQL
 //! consumers, not of the indexer.
 
-pub mod builtin;
 pub mod config;
 pub mod database;
 pub mod indexer;
